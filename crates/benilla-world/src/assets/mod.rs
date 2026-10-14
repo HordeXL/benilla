@@ -66,7 +66,9 @@ fn open_world_assets(mut commands: Commands, device: Res<RenderDevice>) {
     commands.insert_resource(RenderConfig { unload_budget });
 
     match open_chain(&data) {
-        Ok(chain) => commands.insert_resource(WorldAssets::open(chain, light_buf)),
+        // `data` is the `Data` directory the chain was opened from: its sibling `Fonts\` is where
+        // a player's replacement fonts live, and a font read prefers them.
+        Ok(chain) => commands.insert_resource(WorldAssets::open(chain, light_buf, Some(&data))),
         Err(e) => error!("failed to open client data: {e:#}"),
     }
 }

@@ -1,7 +1,7 @@
 //! `benilla-assets`: the WoW 1.12.1 MPQ patch chain as an `mpq://` Bevy asset source backed by
 //! [`benilla_formats::Chain`], and the per-format loaders (BLP, M2, WMO, ADT, WDT) on top of it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -65,6 +65,9 @@ pub const MPQ_SOURCE: &str = "mpq";
 #[derive(Clone)]
 pub struct MpqAssetReader {
     chain: Arc<Chain>,
+    /// The player's `Fonts\` folder beside the `Data` directory ([`loose_font_dir`]), read before
+    /// the archives for a `fonts/…` path. `None` where the install has no such folder.
+    font_dir: Option<PathBuf>,
 }
 
 impl MpqAssetReader {
@@ -72,8 +75,55 @@ impl MpqAssetReader {
     pub fn open(data_dir: &Path) -> Result<Self> {
         Ok(Self {
             chain: Arc::new(Chain::open(data_dir)?),
+            font_dir: loose_font_dir(data_dir),
         })
     }
+}
+
+/// The install root beside a `Data` directory: `…/WoW 1.12` for a `…/WoW 1.12/Data`, where the
+/// player's own loose files live — `Fonts\` among them.
+pub fn install_root(data_dir: &Path) -> Option<&Path> {
+    data_dir.parent()
+}
+
+/// The player's `Fonts\` folder, when the install has one. A loose file in it replaces the
+/// archives' own of the same name, which is how a WoW player swaps the client's typeface: an
+/// install can carry a face the MPQs do not, or a better one than they do.
+pub fn loose_font_dir(data_dir: &Path) -> Option<PathBuf> {
+    let dir = install_root(data_dir)?.join("Fonts");
+    dir.is_dir().then_some(dir)
+}
+
+/// Resolve a `Fonts/…` asset path — either case, either separator — to a file under the player's
+/// `Fonts\` folder, each component matched case-insensitively as Windows does. A dot-component, or
+/// one the host reads as more than a plain name (a Windows `C:`), is refused, so a path cannot
+/// escape the folder. `None` for any other path, and for the archive's own names when there is
+/// nothing loose to read.
+pub fn loose_font_file(font_dir: &Path, internal: &str) -> Option<PathBuf> {
+    let rel = internal.replace('\\', "/").to_ascii_lowercase();
+    let rest = rel.strip_prefix("fonts/")?;
+    let mut at = font_dir.to_path_buf();
+    for comp in rest.split('/') {
+        let plain = matches!(
+            Path::new(comp).components().collect::<Vec<_>>()[..],
+            [std::path::Component::Normal(_)]
+        );
+        if !plain || comp.starts_with('.') {
+            return None;
+        }
+        let direct = at.join(comp);
+        if direct.exists() {
+            at = direct;
+            continue;
+        }
+        let found = std::fs::read_dir(&at).ok()?.flatten().find(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(comp))
+        })?;
+        at = found.path();
+    }
+    at.is_file().then_some(at)
 }
 
 impl AssetReader for MpqAssetReader {
@@ -84,6 +134,17 @@ impl AssetReader for MpqAssetReader {
         // The sampler-mode marker (`texture_url`) names the asset, not the archive file.
         let stripped = strip_sampler_marker(raw);
         let internal = stripped.as_deref().unwrap_or(raw);
+        // The player's own `Fonts\` folder wins over the archives' for a font: that is how the
+        // client's typeface is replaced, and an install whose MPQs carry no CJK face still gets
+        // its Chinese drawn.
+        if let Some(bytes) = self
+            .font_dir
+            .as_deref()
+            .and_then(|dir| loose_font_file(dir, internal))
+            .and_then(|file| std::fs::read(file).ok())
+        {
+            return Ok(VecReader::new(bytes));
+        }
         if !self.chain.contains(internal) {
             return Err(AssetReaderError::NotFound(path.to_path_buf()));
         }
@@ -579,5 +640,82 @@ mod tests {
             "ADT tile loaded: {} MCNK cells, {n_doodads} doodad placements",
             drawn.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod loose_font_tests {
+    use super::*;
+
+    /// A temp `install` with a `Data` and a `Fonts` folder, and a fixture `Fonts\` root.
+    fn fixture(install: &Path) -> (PathBuf, PathBuf) {
+        let data = install.join("Data");
+        let fonts = install.join("Fonts");
+        std::fs::create_dir_all(&fonts).unwrap();
+        std::fs::write(fonts.join("FRIZQT__.TTF"), b"loose friz").unwrap();
+        std::fs::write(fonts.join("fzxhljw.ttf"), b"loose cjk").unwrap();
+        (data, fonts)
+    }
+
+    #[test]
+    fn loose_font_dir_is_the_installs_sibling_fonts_folder() {
+        let dir = std::env::temp_dir().join(format!("benilla-lfd-{}", std::process::id()));
+        let install = dir.join("WoW 1.12");
+        let (data, fonts) = fixture(&install);
+        assert_eq!(loose_font_dir(&data), Some(fonts.clone()));
+        // No sibling `Fonts\` folder: `None`, and a chain opened from a bare `.MPQ` has none.
+        assert_eq!(loose_font_dir(&data.join("fonts.MPQ")), None);
+        assert_eq!(install_root(&data), Some(install.as_path()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn loose_font_file_matches_either_case_either_separator() {
+        let dir = std::env::temp_dir().join(format!("benilla-lff-{}", std::process::id()));
+        let fonts = dir.join("Fonts");
+        std::fs::create_dir_all(&fonts).unwrap();
+        std::fs::write(fonts.join("FRIZQT__.TTF"), b"loose friz").unwrap();
+        std::fs::write(fonts.join("fzxhljw.ttf"), b"loose cjk").unwrap();
+
+        let friz = fonts.join("FRIZQT__.TTF");
+        let expect = friz.to_string_lossy().to_ascii_lowercase();
+        for path in [
+            "fonts/frizqt__.ttf",
+            "Fonts\\FRIZQT__.TTF",
+            "FONTS/FrizQt__.ttf",
+        ] {
+            // Compared case-insensitively: a case-insensitive host matches the queried name
+            // directly and hands it back, a case-sensitive one finds the on-disk spelling by scan.
+            // Either way it is the same file, so the bytes are what settles it.
+            let found = loose_font_file(&fonts, path).unwrap_or_else(|| panic!("{path:?}"));
+            assert_eq!(
+                found.to_string_lossy().to_ascii_lowercase(),
+                expect,
+                "{path:?}"
+            );
+            assert_eq!(std::fs::read(&found).unwrap(), b"loose friz", "{path:?}");
+        }
+        // Any name in the loose folder, whatever the archive calls it.
+        assert_eq!(
+            loose_font_file(&fonts, "fonts/fzxhljw.ttf"),
+            Some(fonts.join("fzxhljw.ttf"))
+        );
+
+        // Not a font path, not there, or trying to escape: a miss, never a guess.
+        for miss in [
+            "fonts/ARIALN.TTF",
+            "fonts/morpheus.ttf",
+            "world/azeroth/foo.blp",
+            "interface/addons/jukebox/track.mp3",
+            "fonts/../secret.ttf",
+            "fonts/",
+            "fonts/C:/secret.ttf",
+        ] {
+            assert!(
+                loose_font_file(&fonts, miss).is_none(),
+                "{miss:?} must not resolve"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

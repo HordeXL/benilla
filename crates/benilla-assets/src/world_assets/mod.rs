@@ -46,6 +46,10 @@ pub struct WorldAssets {
     /// The AddOns folder, where `Interface\AddOns\` paths resolve as loose files, as the reference
     /// reads them from the game directory; `None` until the app installs it and in capture runs.
     loose_root: Option<PathBuf>,
+    /// The player's `Fonts\` folder beside the `Data` directory ([`crate::loose_font_dir`]). Its
+    /// files win over the archives', so a replaced `FRIZQT__` reaches the UI and an install whose
+    /// MPQs carry no CJK face still has one to draw Chinese with.
+    font_dir: Option<PathBuf>,
     /// Materials deduped by [`MaterialKey`].
     pub model_materials: SpatialCache<MaterialKey, Handle<WowModelMaterial>>,
     /// The shared global-light buffer, cloned into every deduped model material's `light_buf`.
@@ -260,8 +264,10 @@ impl<T> LockRecover<T> for Mutex<T> {
 
 impl WorldAssets {
     /// Open the store over an opened patch chain. `shared_light` is a raw `Buffer`, not the
-    /// client's `SharedLightBuffer`, which keeps this crate below the renderer.
-    pub fn open(chain: Chain, shared_light: Buffer) -> Self {
+    /// client's `SharedLightBuffer`, which keeps this crate below the renderer. `data_dir` is the
+    /// `Data` directory the chain was opened from, whose sibling `Fonts\` a font read prefers;
+    /// `None` (a chain opened from a single `.MPQ`) has no loose font folder at all.
+    pub fn open(chain: Chain, shared_light: Buffer, data_dir: Option<&Path>) -> Self {
         Self {
             chain: Arc::new(Mutex::new(chain)),
             textures: SpatialCache::default(),
@@ -273,6 +279,7 @@ impl WorldAssets {
             masks: HashMap::new(),
             generated: HashMap::new(),
             loose_root: None,
+            font_dir: data_dir.and_then(crate::loose_font_dir),
             model_materials: SpatialCache::default(),
             shared_light,
         }
@@ -282,6 +289,25 @@ impl WorldAssets {
     /// `PlayMusic`, `PlaySoundFile`).
     pub fn read_file_or_loose(&self, path: &str) -> Option<Vec<u8>> {
         read_chain_or_loose(&self.chain, self.loose_root.as_deref(), path)
+    }
+
+    /// Read a client font, the player's `Fonts\` folder first and the archives second.
+    ///
+    /// `loose_addon_file` resolves loose files only under `Interface\AddOns\`, so the font folder
+    /// needs its own leg — and it needs it to win, because a player who dropped a replacement
+    /// `FRIZQT__.ttf` there intends to override the one in `fonts.MPQ`. A miss in both stores is
+    /// `None`, as every caller's skip path expects.
+    pub fn read_font(&self, path: &str) -> Option<Vec<u8>> {
+        if let Some(file) = self
+            .font_dir
+            .as_deref()
+            .and_then(|dir| crate::loose_font_file(dir, path))
+        {
+            if let Ok(bytes) = std::fs::read(file) {
+                return Some(bytes);
+            }
+        }
+        self.chain.lock_recover().read(path).ok()
     }
 
     /// Install or clear the AddOns folder. Cached misses are evicted so a path asked before it

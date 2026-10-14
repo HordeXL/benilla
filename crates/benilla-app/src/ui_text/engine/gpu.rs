@@ -13,11 +13,12 @@ use bevy::render::render_resource::{
 use bevy::render::renderer::RenderQueue;
 use bevy::render::texture::GpuImage;
 use bevy::render::{ExtractSchedule, Render, RenderApp, RenderSystems};
+use bevy::text::CosmicFontSystem;
 use bevy::window::PrimaryWindow;
 
-use benilla_assets::WorldAssets;
+use benilla_assets::{LockRecover, WorldAssets};
 
-use super::{TextEngine, UiFontAtlas};
+use super::{faces, TextEngine, UiFontAtlas};
 use crate::ui_text::pack::CellUpload;
 
 /// Cells rasterized this frame, waiting for the render world.
@@ -37,7 +38,7 @@ impl Plugin for UiTextPlugin {
         // exist. `publish_sheet` runs in `Last`, after every producer of text quads, so a cell
         // rasterized this frame is queued before the render extract.
         app.init_resource::<GlyphUploadQueue>()
-            .add_systems(Update, init)
+            .add_systems(Update, (init, load_cjk_face_into_bevy_text))
             .add_systems(Last, publish_sheet);
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -75,6 +76,74 @@ fn init(
         generation: 0,
         ellipsis: crate::ui_text::EllipsisMemo::default(),
     });
+}
+
+/// Marks [`load_cjk_face_into_bevy_text`] done, so the face is loaded into Bevy's font system once.
+#[derive(Resource)]
+struct CjkFaceInBevyText;
+
+/// Put the install's own CJK face into *Bevy's* font system, which the glue screens draw through.
+///
+/// There are two font systems here. [`TextEngine`] shapes the in-game UI off its own database, and
+/// [`TextEngine::load`] already registers the install's CJK face there. Bevy's `Text` — the login,
+/// realm, character-select and character-create screens — shapes off `CosmicFontSystem` instead,
+/// whose database holds only the faces loaded as Bevy `Font` assets: `Fonts\FRIZQT__.TTF` and
+/// `Fonts\ARIALN.TTF`, neither of which carries a single CJK code point. A localized client's glue
+/// strings are Chinese (`GlueStrings.lua`, 429 entries), so every one of them drew as `.notdef`
+/// boxes until this ran.
+///
+/// Loading the face is enough: cosmic-text's fallback reaches any face in the database, asserted by
+/// `differential_tests::a_whole_string_falls_back_to_the_install_cjk_face`. Latin keeps Friz and
+/// only the characters Friz cannot draw land on the CJK face.
+///
+/// It must run *before* the first shape, not merely before the first frame that shows text:
+/// cosmic-text caches a shape run by `(text, attrs)` with no font-database version in the key, so a
+/// string shaped while the face is missing keeps its `.notdef` answer after the face lands. `Update`
+/// precedes the `PostUpdate` shaping systems, and `WorldAssets` is inserted in `Startup`, so the
+/// face is in the database first. Moving this later would fail silently, back to boxes.
+///
+/// The reference picks the glue face from the client's `GlueXML\GlueFonts.xml` (`GlueFontNormal`,
+/// `Fonts\FZLBJW.TTF` on this zhCN install); benilla takes the install's best CJK face instead, the
+/// same discovery [`TextEngine`] uses, so a publisher renaming the face cannot break it. The Latin
+/// face stays `FRIZQT__`, the enUS glue font benilla already hardcodes.
+fn load_cjk_face_into_bevy_text(
+    mut commands: Commands,
+    world_assets: Option<Res<WorldAssets>>,
+    mut font_system: Option<ResMut<CosmicFontSystem>>,
+    done: Option<Res<CjkFaceInBevyText>>,
+) {
+    if done.is_some() {
+        return;
+    }
+    let (Some(world_assets), Some(font_system)) = (world_assets, font_system.as_mut()) else {
+        return;
+    };
+    let chain = world_assets.chain.lock_recover();
+    // `Chain::list`, the union of every archive's listfile: one archive's own answers with
+    // `speech2.MPQ`'s sound-only list, which holds no `.ttf` at all.
+    let listed: Vec<String> = chain
+        .list()
+        .map(|entries| entries.into_iter().map(|e| e.name).collect())
+        .unwrap_or_else(|e| {
+            warn!("bevy text: the patch chain has no listfile union to scan for a CJK face: {e:#}");
+            Vec::new()
+        });
+    // Dropped before the read: `read_font` locks the chain itself, and the `Mutex` is not
+    // reentrant. The loose `Fonts\` folder wins there too, so a replacement face is what lands.
+    drop(chain);
+    let Some((path, bytes)) = faces::cjk_fallback_face(&listed, |n| world_assets.read_font(n))
+    else {
+        // A Latin-only install: nothing to add, and Bevy's own faces already cover its text.
+        return;
+    };
+    font_system
+        .0
+        .db_mut()
+        .load_font_source(fontdb::Source::Binary(
+            Arc::new(bytes) as Arc<dyn AsRef<[u8]> + Sync + Send>
+        ));
+    info!("bevy text: the install's CJK face {path} is loaded for the glue screens' fallback");
+    commands.insert_resource(CjkFaceInBevyText);
 }
 
 /// The frame boundary: follow the window's DPI, carry out a pending reset, create the sheet's

@@ -96,6 +96,22 @@ pub(super) struct GlyphRef {
 /// character shaping to two glyphs would take two steps; in the client faces none does.
 pub(super) struct CharCell {
     pub(super) glyphs: Vec<GlyphRef>,
+    /// The face the glyphs actually shaped in: the requested one, or the CJK fallback when it is
+    /// the face that carried the character. Every glyph's raster key is read under this id, so the
+    /// drawing path must key cells by it, not by the requested face.
+    pub(super) font_id: fontdb::ID,
+}
+
+/// What one shaping pass over one character under one face produced: the glyphs the shaper chose,
+/// the face they came from, and the attrs the pass asked for — the last only so a miss can be
+/// reported with the family and weight that failed.
+struct Shaped {
+    glyphs: Vec<GlyphRef>,
+    /// The face the shaper actually used; a substitute when it could not honour the request.
+    font_id: fontdb::ID,
+    family: String,
+    weight: fontdb::Weight,
+    style: fontdb::Style,
 }
 
 /// What the cache instrument (`WOW_GLYPH_CACHE=1`) counts.
@@ -127,12 +143,23 @@ pub(crate) struct TextEngine {
     /// Paths that failed to load, read and warned once; a font file does not appear mid-session.
     missing_fonts: HashSet<String>,
     default_face: usize,
+    /// The face a character the requested one cannot draw falls back to, discovered from the
+    /// install ([`faces::cjk_fallback_face`]); `None` on an install whose client faces cover the
+    /// UI, which is every English one. Named `fallback` and not `default`: this one is per
+    /// character, chosen only after the requested face shapes nothing.
+    fallback_face: Option<usize>,
+    /// Set once the fallback has carried a character, so its banner logs once per session rather
+    /// than once per character the localized UI draws.
+    fallback_noted: bool,
     /// The window's `scale_factor`. Every raster size derives from it ([`Self::ppem`]), so a
     /// change invalidates no cell, only the measures taken under the old value.
     dpi: f32,
-    /// `(face, ppem, char)` to pen metrics; never touches the GPU, so the VM's measurer fills it.
+    /// `(requested face, ppem, char)` to pen metrics; never touches the GPU, so the VM's measurer
+    /// fills it. The key names the face asked for, while the cell records the face that actually
+    /// shaped ([`CharCell::font_id`]), which is the CJK fallback for a character it carried.
     chars: HashMap<(usize, u16, char), CharCell>,
-    /// `(face, glyph, ppem, radius)` to cell; `None` for no ink or no room, so a miss is paid once.
+    /// `(shaping face, glyph, ppem, radius)` to cell; `None` for no ink or no room, so a miss is
+    /// paid once. Keyed by [`CharCell::font_id`], never by the requested face.
     cells: HashMap<GlyphKey, Option<GlyphInfo>>,
     sheet: Sheet,
     /// Bumped on a [reset][Sheet::reset], the only event that moves a UV, so it is what a
@@ -141,6 +168,8 @@ pub(crate) struct TextEngine {
     /// Set when an allocation failed; acted on at the frame boundary, never mid-string.
     reset_pending: bool,
     complained: HashSet<char>,
+    /// Faces whose request the shaper answered with a different face, so the substitution warning
+    /// fires once per face, not once per character ([`Self::note_substitution`]).
     substituted: HashSet<usize>,
     over_ceiling: bool,
     stats: CacheStats,
@@ -155,47 +184,115 @@ fn client_font_system() -> FontSystem {
     FontSystem::new_with_locale_and_db("en-US".to_string(), fontdb::Database::new())
 }
 
+/// Register one face off `bytes` and record it as `path`'s; a face that will not parse or register
+/// warns and is skipped, which leaves its path on the caller's miss path.
+fn register_face(
+    font_system: &mut FontSystem,
+    faces: &mut Vec<Face>,
+    path_to_face: &mut HashMap<String, usize>,
+    path: &str,
+    bytes: Vec<u8>,
+) {
+    let ascent_ratio = hhea_ascent_ratio(&bytes).unwrap_or(0.794);
+    let sfnt = sfnt::Sfnt::parse(bytes.clone()).map(Arc::new);
+    match register_font(font_system, bytes) {
+        Ok(r) => {
+            path_to_face.insert(path.to_ascii_lowercase(), faces.len());
+            faces.push(Face {
+                id: r.id,
+                path: path.to_string(),
+                family: r.family,
+                weight: r.weight,
+                style: r.style,
+                stretch: r.stretch,
+                ascent_ratio,
+                sfnt,
+            });
+        }
+        Err(e) => warn!("ui_text: failed to register {path}: {e:#}"),
+    }
+}
+
+/// Discover and register the install's CJK face: every `.ttf` the chain lists is scored by
+/// [`faces::cjk_fallback_face`], and the winner is registered like any other face so it lands in
+/// the same database. `None` when no face carries CJK, which is every English install.
+///
+/// The listing must be the chain's **union** of every archive's `(listfile)`
+/// ([`benilla_formats::Chain::list`]), not one archive's: reading `"(listfile)"` through
+/// [`Chain::read`][benilla_formats::Chain::read] resolves to whichever archive wins, and on a
+/// stock install that is `speech2.MPQ`, whose listfile names only sound — no font at all. The
+/// union is where `fonts.MPQ`'s own names appear.
+///
+/// Deviation from the reference: the reference reaches a localized face through its localized
+/// `Fonts.xml`, whose `SetFont` names the file. benilla loads the English FrameXML, so it never
+/// asks for one; this picks the face by its coverage instead, so a localized install draws its own
+/// text without a per-locale name table nobody can keep current.
+fn load_fallback_face(
+    font_system: &mut FontSystem,
+    faces: &mut Vec<Face>,
+    path_to_face: &mut HashMap<String, usize>,
+    listed: &[String],
+    read: &impl Fn(&str) -> Option<Vec<u8>>,
+) -> Option<usize> {
+    let (path, bytes) = faces::cjk_fallback_face(listed, read)?;
+    if let Some(&i) = path_to_face.get(&path.to_ascii_lowercase()) {
+        return Some(i);
+    }
+    let before = faces.len();
+    register_face(font_system, faces, path_to_face, &path, bytes);
+    (faces.len() > before).then_some(before)
+}
+
 impl TextEngine {
-    /// Register the client TTFs off the patch chain; `None`, and no text, without Friz Quadrata.
+    /// Register the client TTFs off the install — the player's `Fonts\` folder first, then the
+    /// archives; `None`, and no text, without Friz Quadrata.
     fn load(world_assets: &WorldAssets, images: &Assets<Image>, dpi: f32) -> Option<Self> {
         let mut font_system = client_font_system();
         let mut faces: Vec<Face> = Vec::new();
         let mut path_to_face = HashMap::new();
-        for &path in CLIENT_FONTS {
-            let bytes = {
-                let chain = world_assets.chain.lock_recover();
-                match chain.read(path) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!("ui_text: failed to read {path} from the patch chain: {e:#}");
-                        continue;
-                    }
-                }
-            };
-            let ascent_ratio = hhea_ascent_ratio(&bytes).unwrap_or(0.794);
-            let sfnt = sfnt::Sfnt::parse(bytes.clone()).map(Arc::new);
-            match register_font(&mut font_system, bytes) {
-                Ok(r) => {
-                    path_to_face.insert(path.to_ascii_lowercase(), faces.len());
-                    faces.push(Face {
-                        id: r.id,
-                        path: path.to_string(),
-                        family: r.family,
-                        weight: r.weight,
-                        style: r.style,
-                        stretch: r.stretch,
-                        ascent_ratio,
-                        sfnt,
-                    });
-                }
-                Err(e) => warn!("ui_text: failed to register {path}: {e:#}"),
+        // The player's `Fonts\` folder first, the archives second ([`WorldAssets::read_font`]): a
+        // player who replaced `FRIZQT__` there means it, and the archives may carry no CJK face at
+        // all while the loose folder does.
+        let read = |path: &str| match world_assets.read_font(path) {
+            Some(bytes) => Some(bytes),
+            None => {
+                warn!("ui_text: failed to read {path} from the install");
+                None
             }
+        };
+        for &path in CLIENT_FONTS {
+            let Some(bytes) = read(path) else { continue };
+            register_face(&mut font_system, &mut faces, &mut path_to_face, path, bytes);
         }
+        // The chain's union of every archive's `(listfile)`, where `fonts.MPQ`'s names live: one
+        // archive's own listfile (whichever `Chain::read` would resolve) names only its own files.
+        let listed: Vec<String> = world_assets
+            .chain
+            .lock_recover()
+            .list()
+            .map(|entries| entries.into_iter().map(|e| e.name).collect())
+            .unwrap_or_else(|e| {
+                warn!(
+                    "ui_text: the patch chain has no listfile union to scan for a CJK face: {e:#}"
+                );
+                Vec::new()
+            });
+        let fallback_face = load_fallback_face(
+            &mut font_system,
+            &mut faces,
+            &mut path_to_face,
+            &listed,
+            &read,
+        );
         let default_face = *path_to_face.get(&CLIENT_FONTS[0].to_ascii_lowercase())?;
         info!(
-            "ui_text: font engine ready — {} face(s), glyphs rasterized on demand at {dpi}× \
+            "ui_text: font engine ready — {} face(s){}, glyphs rasterized on demand at {dpi}× \
              device pixels",
-            faces.len()
+            faces.len(),
+            fallback_face.map_or(String::new(), |i| format!(
+                ", CJK fallback {}",
+                faces[i].path
+            ))
         );
         Some(Self {
             font_system,
@@ -208,6 +305,8 @@ impl TextEngine {
             }),
             missing_fonts: HashSet::new(),
             default_face,
+            fallback_face,
+            fallback_noted: false,
             dpi,
             chars: HashMap::new(),
             cells: HashMap::new(),
@@ -350,14 +449,18 @@ impl TextEngine {
     /// One character: shape it alone into its [`CharCell`] and rasterize its glyphs at `radius`.
     /// Alone, so a glyph's metrics hold no neighbour term (the pair kern is [`Self::step`]'s) and
     /// one table answers a measure and a draw.
+    ///
+    /// A character the requested face cannot draw is re-shaped under the install's CJK face
+    /// ([`TextEngine::fallback_face`]), so a localized client's own text draws instead of vanishing.
+    /// The reference reaches the localized face through the localized `Fonts.xml`, which names it;
+    /// benilla loads the English FrameXML and would otherwise never ask for one at all.
     fn ensure_char(&mut self, face: usize, ppem: u16, radius: Option<u8>, ch: char) {
         if let Some(known) = self.chars.get(&(face, ppem, ch)) {
             let Some(radius) = radius else { return };
-            // The pen metrics are cached; the cells for this radius may not be.
+            // The pen metrics are cached; the cells for this radius may not be. The id is the
+            // *shaping* face's, off the cell: a fallback glyph's cell is keyed by the fallback.
             let glyphs = known.glyphs.clone();
-            let Some(id) = self.faces.get(face).map(|f| f.id) else {
-                return;
-            };
+            let id = known.font_id;
             for g in &glyphs {
                 self.ensure_cell(id, ppem, radius, g);
             }
@@ -366,14 +469,101 @@ impl TextEngine {
         // A control character (`\n`, which the markup parser takes as a line break) has no glyph
         // by design: an empty cell, before any shaping, so it neither re-shapes nor warns.
         if ch.is_control() {
-            self.chars
-                .insert((face, ppem, ch), CharCell { glyphs: Vec::new() });
+            let Some(id) = self.faces.get(face).map(|f| f.id) else {
+                return;
+            };
+            self.chars.insert(
+                (face, ppem, ch),
+                CharCell {
+                    glyphs: Vec::new(),
+                    font_id: id,
+                },
+            );
             return;
         }
-        let Some(f) = self.faces.get(face) else {
+        let Some(primary) = self.shape_in(face, ppem, ch) else {
             return;
         };
-        let (face_id, family, weight, style, stretch) =
+        // A face the shaper used that is not the one asked for: the character still draws, in
+        // whichever face got there first. Warned once per face (the precedent at the whole-string
+        // path), because a localized family that names no installed face is a real content bug.
+        self.note_substitution(face, &primary, ch);
+        let (mut shaped, mut source) = (primary.glyphs, primary.font_id);
+        if !draws_something(&shaped) {
+            if let Some(fb) = self.fallback_face.filter(|&fb| fb != face) {
+                if let Some(alt) = self.shape_in(fb, ppem, ch) {
+                    if draws_something(&alt.glyphs) {
+                        if !self.fallback_noted {
+                            self.fallback_noted = true;
+                            info!(
+                                "ui_text: {ch:?} falls back from {} to {} — the install's CJK face",
+                                self.faces[face].path, self.faces[fb].path
+                            );
+                        }
+                        (shaped, source) = (alt.glyphs, alt.font_id);
+                    }
+                }
+            }
+        }
+        if !draws_something(&shaped) {
+            // No glyph of any face draws it: it draws and measures nothing, once. The `.notdef`
+            // the requested face answered with is dropped, so the character is an empty cell the
+            // measure and the draw both read as zero, as the reference's missing glyph is.
+            shaped.clear();
+            if self.complained.insert(ch) {
+                warn!("ui_text: no glyph for {ch:?} in any registered face");
+            }
+            // Cache the miss as an empty cell, or every frame's pre-warm shapes it again.
+            self.chars.insert(
+                (face, ppem, ch),
+                CharCell {
+                    glyphs: shaped,
+                    font_id: source,
+                },
+            );
+            return;
+        }
+        self.stats.chars_shaped += 1;
+        // The metrics off the shaping face's own tables, as FreeType computes them; a glyph another
+        // face shaped keeps the shaper's advance and reads its ink off the outline. The table is
+        // the *shaping* face's, which is the fallback's for a character it carried, so a fallback
+        // glyph's advance is its own face's, never Friz's.
+        let sfnt = self
+            .faces
+            .iter()
+            .find(|f| f.id == source)
+            .and_then(|f| f.sfnt.clone());
+        for g in &mut shaped {
+            let own = sfnt
+                .as_deref()
+                .filter(|_| g.key.font_id == source)
+                .and_then(|t| t.glyph(g.glyph_id, ppem));
+            match own {
+                Some(m) => (g.px, g.ink) = (m.advance, m.ink),
+                None => g.ink = glyph_ink(&mut self.swash, &mut self.font_system, g.key, ppem),
+            }
+        }
+        if let Some(radius) = radius {
+            for g in &shaped {
+                let g = *g;
+                self.ensure_cell(source, ppem, radius, &g);
+            }
+        }
+        self.chars.insert(
+            (face, ppem, ch),
+            CharCell {
+                glyphs: shaped,
+                font_id: source,
+            },
+        );
+    }
+
+    /// Shape one character alone under `face`'s family and axes; `None` when `face` is out of
+    /// range. The attrs name the family, so `cosmic-text` may answer with another face that can
+    /// draw the character — that is the caller's to notice, not this function's.
+    fn shape_in(&mut self, face: usize, ppem: u16, ch: char) -> Option<Shaped> {
+        let f = self.faces.get(face)?;
+        let (font_id, family, weight, style, stretch) =
             (f.id, f.family.clone(), f.weight, f.style, f.stretch);
         let attrs = Attrs::new()
             .family(Family::Name(&family))
@@ -410,54 +600,40 @@ impl TextEngine {
                 }
             }
         }
-        // Naming a face to `cosmic-text` is a query that takes the first face able to draw the
-        // character, so an unmatched family draws and measures in another face: warned once.
-        if let Some(got) = shaped_by.filter(|&got| got != face_id) {
-            if self.substituted.insert(face) {
-                let got_name = self
-                    .font_system
-                    .db()
-                    .face(got)
-                    .map_or_else(|| format!("{got:?}"), |i| i.post_script_name.clone());
-                let want = self.faces.get(face).map_or("?", |f| f.path.as_str());
-                warn!(
-                    "ui_text: '{want}' loaded as family {family:?} (weight {}, style {style:?}) \
-                     but {ch:?} shaped in {got_name} instead — text in this face draws and \
-                     measures in the wrong one",
-                    weight.0
-                );
-            }
-        }
-        if glyphs.is_empty() {
-            // No face shaped it: it draws and measures nothing, and warns once.
-            if self.complained.insert(ch) {
-                warn!("ui_text: no glyph for {ch:?} in any registered face");
-            }
-            // Cache the miss as an empty cell, or every frame's pre-warm shapes it again.
-            self.chars.insert((face, ppem, ch), CharCell { glyphs });
+        Some(Shaped {
+            glyphs,
+            font_id: shaped_by.unwrap_or(font_id),
+            family,
+            weight,
+            style,
+        })
+    }
+
+    /// Warn once when a character shapes in a face other than the one asked for: naming a face to
+    /// `cosmic-text` is a query that takes the first face able to draw the character, so an
+    /// unmatched family draws and measures in another face, silently.
+    fn note_substitution(&mut self, face: usize, shaped: &Shaped, ch: char) {
+        if shaped.glyphs.is_empty() {
             return;
         }
-        self.stats.chars_shaped += 1;
-        // The metrics off the face's own tables, as FreeType computes them; a glyph another face
-        // shaped keeps the shaper's advance and reads its ink off the outline.
-        let sfnt = self.faces.get(face).and_then(|f| f.sfnt.clone());
-        for g in &mut glyphs {
-            let own = sfnt
-                .as_deref()
-                .filter(|_| g.key.font_id == face_id)
-                .and_then(|t| t.glyph(g.glyph_id, ppem));
-            match own {
-                Some(m) => (g.px, g.ink) = (m.advance, m.ink),
-                None => g.ink = glyph_ink(&mut self.swash, &mut self.font_system, g.key, ppem),
-            }
+        let want_id = self.faces.get(face).map(|f| f.id);
+        if want_id == Some(shaped.font_id) {
+            return;
         }
-        if let Some(radius) = radius {
-            for g in &glyphs {
-                let g = *g;
-                self.ensure_cell(face_id, ppem, radius, &g);
-            }
+        if self.substituted.insert(face) {
+            let got_name = self.font_system.db().face(shaped.font_id).map_or_else(
+                || format!("{:?}", shaped.font_id),
+                |i| i.post_script_name.clone(),
+            );
+            let want = self.faces.get(face).map_or("?", |f| f.path.as_str());
+            warn!(
+                "ui_text: '{want}' loaded as family {:?} (weight {}, style {:?}) but {ch:?} shaped \
+                 in {got_name} instead — text in this face draws and measures in the wrong one",
+                shaped.family,
+                shaped.weight.0,
+                shaped.style
+            );
         }
-        self.chars.insert((face, ppem, ch), CharCell { glyphs });
     }
 
     /// The step from glyph `left` to the glyph after it in device px, `ComputeStep` (`0x5ca2d0`):
@@ -465,6 +641,11 @@ impl TextEngine {
     /// the ceil (`0x73fdf5`). `stepBase` is the whole-pixel advance plus the law's bias
     /// (`step_extra`: `0x5d12a9`, and `0x5ca2b0` for THICK); the kern is the face's unscaled pair
     /// value (`FT_Get_Kerning` mode 2). With no glyph after it, the step is the base.
+    ///
+    /// The pair is kerned off the table of the face that shaped both glyphs
+    /// ([`CharCell::font_id`]), not the requested `face`: a CJK fallback glyph and its neighbour
+    /// share the fallback, so their pair reads the fallback's `kern` table, and a pair split
+    /// across two faces takes no kern at all — a kern is a property of one face's outlines.
     pub(super) fn step(
         &self,
         face: usize,
@@ -477,13 +658,19 @@ impl TextEngine {
         let Some(right) = right else {
             return base;
         };
-        let Some(f) = self.faces.get(face) else {
+        // The face that shaped `left`, when it is the one asked for or the registered fallback;
+        // anything else (an unregistered id) has no table here.
+        let id = left.key.font_id;
+        let Some(t) = self
+            .faces
+            .get(face)
+            .filter(|f| f.id == id)
+            .or_else(|| self.faces.iter().find(|f| f.id == id))
+            .and_then(|f| f.sfnt.as_deref())
+        else {
             return base;
         };
-        let Some(t) = f.sfnt.as_deref() else {
-            return base;
-        };
-        if left.key.font_id != f.id || right.key.font_id != f.id {
+        if right.key.font_id != id {
             return base;
         }
         let kern = t.neg_kern(left.glyph_id, right.glyph_id);
@@ -580,7 +767,25 @@ impl TextEngine {
         self.chars.get(&(face, ppem, ch))
     }
 
-    /// One glyph's cell; `None` for a zero-ink glyph, and for one frame after the sheet fills.
+    /// One glyph's cell for the glyphs a character shaped in `face`; `None` for a zero-ink glyph,
+    /// and for one frame after the sheet fills. The face must be the *shaping* one
+    /// ([`CharCell::font_id`]), not the requested one, or a fallback glyph's cell misses.
+    pub(super) fn cell_in(
+        &self,
+        font_id: fontdb::ID,
+        ppem: u16,
+        radius: u8,
+        glyph_id: u16,
+    ) -> Option<GlyphInfo> {
+        self.cells
+            .get(&(font_id, glyph_id, ppem, radius))
+            .copied()
+            .flatten()
+    }
+
+    /// [`Self::cell_in`] by face index, for a caller that asked for a face and expects its own
+    /// glyphs (the tests, and any face the shaper honoured).
+    #[cfg(test)]
     pub(super) fn cell(
         &self,
         face: usize,
@@ -589,10 +794,7 @@ impl TextEngine {
         glyph_id: u16,
     ) -> Option<GlyphInfo> {
         let id = self.faces.get(face)?.id;
-        self.cells
-            .get(&(id, glyph_id, ppem, radius))
-            .copied()
-            .flatten()
+        self.cell_in(id, ppem, radius, glyph_id)
     }
 
     /// The one texture every glyph quad samples.
@@ -649,25 +851,24 @@ pub(super) fn test_engine(dpi: f32) -> Option<TextEngine> {
     let mut font_system = client_font_system();
     let mut faces: Vec<Face> = Vec::new();
     let mut path_to_face = HashMap::new();
+    let read = |path: &str| chain.read(path).ok();
     for &path in CLIENT_FONTS {
-        let Ok(bytes) = chain.read(path) else {
-            continue;
-        };
-        let ascent_ratio = hhea_ascent_ratio(&bytes).unwrap_or(0.794);
-        let sfnt = sfnt::Sfnt::parse(bytes.clone()).map(Arc::new);
-        let r = register_font(&mut font_system, bytes).ok()?;
-        path_to_face.insert(path.to_ascii_lowercase(), faces.len());
-        faces.push(Face {
-            id: r.id,
-            path: path.to_string(),
-            family: r.family,
-            weight: r.weight,
-            style: r.style,
-            stretch: r.stretch,
-            ascent_ratio,
-            sfnt,
-        });
+        let Some(bytes) = read(path) else { continue };
+        register_face(&mut font_system, &mut faces, &mut path_to_face, path, bytes);
     }
+    // The same union the engine builds from: `Chain::list` merges every archive's `(listfile)`,
+    // where reading one archive's own would answer with `speech2.MPQ`'s sound-only list.
+    let listed: Vec<String> = chain
+        .list()
+        .map(|entries| entries.into_iter().map(|e| e.name).collect())
+        .unwrap_or_default();
+    let fallback_face = load_fallback_face(
+        &mut font_system,
+        &mut faces,
+        &mut path_to_face,
+        &listed,
+        &read,
+    );
     let default_face = *path_to_face.get(&CLIENT_FONTS[0].to_ascii_lowercase())?;
     Some(TextEngine {
         font_system,
@@ -681,6 +882,8 @@ pub(super) fn test_engine(dpi: f32) -> Option<TextEngine> {
         }),
         missing_fonts: HashSet::new(),
         default_face,
+        fallback_face,
+        fallback_noted: false,
         dpi,
         chars: HashMap::new(),
         cells: HashMap::new(),
@@ -708,6 +911,15 @@ impl UiFontAtlas {
             ellipsis: crate::ui_text::EllipsisMemo::default(),
         })
     }
+}
+
+/// Whether a shape is worth keeping: at least one glyph that is not `.notdef`. `cosmic-text`
+/// answers a character the named family cannot draw with a run of glyph id 0 rather than an empty
+/// run, so an emptiness test alone would treat "no glyph" as a hit and never reach the fallback.
+/// A zero-ink glyph with a real id (a space) still counts as a hit, which is right: its advance is
+/// what the measure reads, and the rasterizer drops its blank bitmap on its own.
+fn draws_something(glyphs: &[GlyphRef]) -> bool {
+    glyphs.iter().any(|g| g.glyph_id != 0)
 }
 
 /// A glyph's ink as its line's last, in physical px, read off the scaled outline: the fallback for
@@ -871,7 +1083,9 @@ mod line_law_tests {
 mod differential_tests {
     use super::*;
 
-    /// Names, item names, prose, ligature and kerning bait, the Latin-1 tail and the money digits.
+    /// Names, item names, prose, ligature and kerning bait, the Latin-1 tail and the money digits,
+    /// and a Chinese string: the localized client's UI text, which its own faces cannot draw and
+    /// the discovered CJK fallback must.
     const CORPUS: &[&str] = &[
         "",
         " ",
@@ -885,6 +1099,8 @@ mod differential_tests {
         "0123456789",
         "Grüße, Ärger; élan côté",
         "!@#$%^&*()_+-=[]{}|;':\",./<>?",
+        "中文魔兽世界",
+        "任务背包，。：！（）",
     ];
 
     /// In the client fonts a string's glyphs are its characters' glyphs concatenated, the property
@@ -903,7 +1119,7 @@ mod differential_tests {
                 // A small and a large size, so a size-dependent substitution cannot hide.
                 for ppem in [10u16, 20] {
                     for text in CORPUS {
-                        let want = shape_whole(&mut e, &family, ppem, text);
+                        let want = shape_whole(&mut e, face, ppem, text);
                         e.ensure_metrics(face, ppem, text);
                         let got: Vec<u16> = text
                             .chars()
@@ -926,11 +1142,28 @@ mod differential_tests {
         );
     }
 
-    /// The whole string shaped in one buffer: its glyph ids.
-    fn shape_whole(e: &mut TextEngine, family: &str, ppem: u16, text: &str) -> Vec<u16> {
+    /// The whole string shaped in one buffer, under the face asked for and then the discovered
+    /// fallback, exactly as [`TextEngine::ensure_char`] walks it: its glyph ids. A family that
+    /// answers with `.notdef` alone (what `cosmic-text` returns for a character a face cannot
+    /// draw) counts as a miss, the same test [`draws_something`] makes per character.
+    fn shape_whole(e: &mut TextEngine, face: usize, ppem: u16, text: &str) -> Vec<u16> {
         if text.is_empty() {
             return Vec::new();
         }
+        let order = std::iter::once(face).chain(e.fallback_face.filter(|&fb| fb != face));
+        for f in order {
+            let family = e.faces[f].family.clone();
+            let glyphs = shape_whole_in(e, &family, ppem, text);
+            if glyphs.iter().any(|&g| g != 0) {
+                return glyphs;
+            }
+        }
+        Vec::new()
+    }
+
+    /// The whole string shaped under one named family, or nothing when no face of that family
+    /// carries it.
+    fn shape_whole_in(e: &mut TextEngine, family: &str, ppem: u16, text: &str) -> Vec<u16> {
         let attrs = Attrs::new().family(Family::Name(family));
         let px = f32::from(ppem);
         let mut buf = Buffer::new(&mut e.font_system, Metrics::new(px, px));
@@ -940,6 +1173,114 @@ mod differential_tests {
         buf.layout_runs()
             .flat_map(|run| run.glyphs.iter().map(|g| g.glyph_id))
             .collect()
+    }
+
+    /// The whole-string path — what Bevy's own `Text` uses, over its separate `CosmicFontSystem` —
+    /// falls back to the install's CJK face for a character the requested family cannot draw.
+    ///
+    /// This is the mechanism `gpu::load_cjk_face_into_bevy_text` leans on: Bevy's font system holds
+    /// only the faces loaded as `Font` assets, so `ui_text`'s engine registering the CJK face is
+    /// not enough there, and the glue screens would draw Chinese as `.notdef` boxes. Asserts it on
+    /// the engine's own database, which is built the same way (empty, then loaded face by face).
+    #[test]
+    fn a_whole_string_falls_back_to_the_install_cjk_face() {
+        let Some(mut e) = test_engine(1.0) else {
+            eprintln!("skipping: no install / patch chain");
+            return;
+        };
+        if e.fallback_face.is_none() {
+            eprintln!("skipping: this install's fonts carry no CJK");
+            return;
+        }
+        let default_family = e.faces[0].family.clone();
+        assert_ne!(
+            e.fallback_face,
+            Some(0),
+            "the default face is the CJK one here — nothing is proven"
+        );
+        let glyphs = shape_whole_in(&mut e, &default_family, 20, "帐号名称");
+        assert!(
+            glyphs.iter().any(|&g| g != 0),
+            "the default family {default_family:?} cannot draw 帐号名称 and the whole-string \
+             fallback did not carry it: {glyphs:?}"
+        );
+    }
+
+    /// Shapes a whole string under one family in an arbitrary `FontSystem`, as Bevy's
+    /// `TextPipeline` does: `Shaping::Advanced` and `Family::Name`.
+    fn shape_in_system(fs: &mut FontSystem, family: &str, ppem: u16, text: &str) -> Vec<u16> {
+        let attrs = Attrs::new().family(Family::Name(family));
+        let px = f32::from(ppem);
+        let mut buf = Buffer::new(fs, Metrics::new(px, px));
+        buf.set_wrap(fs, Wrap::None);
+        buf.set_text(fs, text, &attrs, Shaping::Advanced, None);
+        buf.shape_until_scroll(fs, false);
+        buf.layout_runs()
+            .flat_map(|run| run.glyphs.iter().map(|g| g.glyph_id))
+            .collect()
+    }
+
+    /// The glue screens' pipeline, modelled exactly, because it is a *second* font system and the
+    /// one the login and character-select screens actually draw through. A Bevy `Text` shapes over
+    /// `CosmicFontSystem`, whose database holds only the faces loaded as Bevy `Font` assets —
+    /// `Fonts\FRIZQT__.TTF` and `Fonts\ARIALN.TTF`, the two the glue screens load — and it shapes
+    /// with `Shaping::Advanced`.
+    ///
+    /// Neither of those faces carries a CJK code point, and a localized client's glue strings are
+    /// Chinese, so every one of them drew as `.notdef` boxes. Loading the install's CJK face into
+    /// the database is what carries them, which `gpu::load_cjk_face_into_bevy_text` does at startup;
+    /// this test fails without that.
+    #[test]
+    fn a_bevy_style_font_system_needs_the_cjk_face_loaded_to_draw_chinese() {
+        let Some(e) = test_engine(1.0) else {
+            eprintln!("skipping: no install / patch chain");
+            return;
+        };
+        let source = e.source.as_ref().expect("the test engine carries a chain");
+        let chain = source.chain.lock_recover();
+        let (Ok(friz), Ok(arialn)) = (
+            chain.read("Fonts\\FRIZQT__.TTF"),
+            chain.read("Fonts\\ARIALN.TTF"),
+        ) else {
+            eprintln!("skipping: this install ships no FRIZQT__/ARIALN");
+            return;
+        };
+        let listed: Vec<String> = chain
+            .list()
+            .map(|entries| entries.into_iter().map(|e| e.name).collect())
+            .unwrap_or_default();
+        let Some((path, cjk)) = faces::cjk_fallback_face(&listed, |n| chain.read(n).ok()) else {
+            eprintln!("skipping: this install's fonts carry no CJK");
+            return;
+        };
+        drop(chain);
+
+        // Bevy's `CosmicFontSystem` exactly: an empty database, then the glue screens' `Font`
+        // assets. Two separate systems, not one loaded in stages: cosmic-text caches a shape run by
+        // (text, attrs) with no font-database version in the key, so shaping 帐号名称 once with the
+        // CJK face missing would cache the `.notdef` run and answer from it after the face lands.
+        // That is exactly why `gpu::load_cjk_face_into_bevy_text` must run before the first shape —
+        // it is in `Update`, the shaping is in `PostUpdate`, and `WorldAssets` is inserted in
+        // `Startup`, so the face is in the database first.
+        let mut without = client_font_system();
+        for bytes in [friz.clone(), arialn.clone()] {
+            without.db_mut().load_font_data(bytes);
+        }
+        let before = shape_in_system(&mut without, "Friz Quadrata TT", 20, "帐号名称");
+        assert!(
+            before.iter().all(|&g| g == 0),
+            "FRIZQT__/ARIALN alone must not draw 帐号名称, or this test proves nothing: {before:?}"
+        );
+
+        let mut with = client_font_system();
+        for bytes in [friz, arialn, cjk] {
+            with.db_mut().load_font_data(bytes);
+        }
+        let after = shape_in_system(&mut with, "Friz Quadrata TT", 20, "帐号名称");
+        assert!(
+            after.iter().any(|&g| g != 0),
+            "loading {path} into the font system must let the fallback carry 帐号名称: {after:?}"
+        );
     }
 }
 
@@ -955,6 +1296,17 @@ mod ppem_tests {
                 None
             }
         }
+    }
+
+    /// A client TTF this install actually ships, for a test that needs some real face as a
+    /// fixture: `MORPHEUS`/`SKURRI` are absent from a localized install, which ships FangZheng
+    /// faces under other names, so a hardcoded index is not portable. The default face (index 0)
+    /// is skipped: a test that loads a copy of it as an addon face would otherwise register a
+    /// second face under the same family name, and the shaper would answer with the original.
+    fn a_present_client_font(e: &TextEngine) -> Option<Vec<u8>> {
+        let source = e.source.as_ref()?;
+        let chain = source.chain.lock_recover();
+        TEST_FACES.iter().skip(1).find_map(|p| chain.read(p).ok())
     }
 
     #[test]
@@ -1078,6 +1430,118 @@ mod ppem_tests {
         assert_ne!(friz, e.face_for(Some(TEST_FACES[1])), "ARIALN is its own");
     }
 
+    /// The engine registers a face the client faces cannot draw with, discovered off the chain's
+    /// listing: skipped only when the chain's fonts carry no CJK at all (an English install).
+    /// This is the whole fix's precondition: without it, [`ensure_char`] has nowhere to fall back.
+    #[test]
+    fn the_engine_registers_a_cjk_fallback_when_the_install_has_one() {
+        let Some(mut e) = engine_or_skip() else {
+            return;
+        };
+        // The chain's union of every `(listfile)`, the same source the engine builds from: one
+        // archive's own listfile (`speech2.MPQ`'s) names no font at all.
+        let listed: Vec<String> = {
+            let source = e.source.as_ref().expect("the test engine carries a chain");
+            let chain = source.chain.lock_recover();
+            chain
+                .list()
+                .expect("the chain lists")
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect()
+        };
+        let has_cjk = {
+            let chain = e.source.as_ref().unwrap().chain.lock_recover();
+            faces::cjk_fallback_face(&listed, |p| chain.read(p).ok()).is_some()
+        };
+        if !has_cjk {
+            eprintln!("skipping: this install's fonts carry no CJK");
+            return;
+        }
+        let fb = e
+            .fallback_face
+            .expect("a CJK face must have been discovered");
+        let face = e.face_for(None);
+        assert_ne!(fb, face, "the fallback is not the requested face");
+        // It must be a registered face, and one that covers CJK — proven by shaping, not by name.
+        assert!(fb < e.faces.len());
+        e.ensure_metrics(face, 20, "中");
+        let cell = e
+            .char_cell(face, 20, '中')
+            .expect("the fallback answer is cached under the requested face");
+        assert!(
+            !cell.glyphs.is_empty(),
+            "中 must shape through the fallback, not vanish"
+        );
+        assert_eq!(
+            cell.font_id, e.faces[fb].id,
+            "the cell records the fallback as the shaping face"
+        );
+    }
+
+    /// A character the requested face cannot draw is carried by the fallback, and the glyph's
+    /// raster lands under the *fallback's* id, so the drawing path (`cell_in`) finds it. Before the
+    /// fix this shaped nothing and cached an empty cell.
+    #[test]
+    fn a_character_the_face_cannot_draw_is_carried_by_the_fallback() {
+        let Some(mut e) = engine_or_skip() else {
+            return;
+        };
+        if e.fallback_face.is_none() {
+            eprintln!("skipping: this install's fonts carry no CJK");
+            return;
+        }
+        let face = e.face_for(None);
+        e.ensure_str(face, 20, 0, "中");
+        let cell = e.char_cell(face, 20, '中').expect("cached");
+        let g = cell.glyphs.first().copied().expect("中 shaped");
+        assert!(
+            e.cell_in(cell.font_id, 20, 0, g.glyph_id).is_some(),
+            "the glyph's cell is keyed by the shaping face"
+        );
+        assert!(
+            e.cell(face, 20, 0, g.glyph_id).is_none(),
+            "…and not by the requested face, which is the trap this fix removes"
+        );
+        assert!(g.px > 0.0, "and the fallback glyph advances");
+    }
+
+    /// An empty shape is cached as a miss: a character neither the requested face nor the fallback
+    /// draws must not re-shape every frame, and the cell must record whichever face was tried.
+    ///
+    /// The character is *found*, not assumed: a localized install's faces map far more of the
+    /// plane than a Latin one's (they carry private-use and noncharacter code points), so a
+    /// hardcoded "surely empty" code point is a false premise. This walks the CJK-fallback
+    /// machinery itself to locate a code point that shapes to nothing.
+    #[test]
+    fn an_empty_shape_is_cached_as_a_miss() {
+        let Some(mut e) = engine_or_skip() else {
+            return;
+        };
+        let face = e.face_for(None);
+        // Try private-use and noncharacter code points until one shapes to nothing here; if this
+        // install maps them all, there is nothing to prove and the test skips rather than lies.
+        let empty = ('\u{E000}'..='\u{E0FF}')
+            .chain(['\u{FFFE}', '\u{FDD0}'])
+            .find(|&c| {
+                e.ensure_char(face, 20, None, c);
+                e.char_cell(face, 20, c)
+                    .is_some_and(|cell| cell.glyphs.is_empty())
+            });
+        let Some(ch) = empty else {
+            eprintln!("skipping: no unshapeable code point found in this install's faces");
+            return;
+        };
+        let cell = e.char_cell(face, 20, ch).expect("the miss is cached");
+        assert!(cell.glyphs.is_empty());
+        let shaped = e.stats.chars_shaped;
+        e.ensure_str(face, 20, 0, &ch.to_string());
+        assert_eq!(
+            e.stats.chars_shaped, shaped,
+            "a cached miss re-shapes nothing, so a warn-per-frame cannot happen"
+        );
+    }
+
     /// Overwrite `OS/2.usWeightClass` (table offset 4) in a raw sfnt, making a bold face out of a
     /// client one; `false` without an `OS/2` table.
     fn set_weight_class(bytes: &mut [u8], weight: u16) -> bool {
@@ -1121,10 +1585,10 @@ mod ppem_tests {
         let Some(mut e) = engine_or_skip() else {
             return;
         };
-        let mut bytes = {
-            let source = e.source.as_ref().expect("the test engine carries a chain");
-            let chain = source.chain.lock_recover();
-            chain.read(TEST_FACES[2]).expect("MORPHEUS is in the chain")
+        // Any client face this install ships; a localized one lacks MORPHEUS/SKURRI.
+        let Some(mut bytes) = a_present_client_font(&e) else {
+            eprintln!("skipping: no client TTF in the chain");
+            return;
         };
         assert!(
             set_weight_class(&mut bytes, 700),
@@ -1159,10 +1623,9 @@ mod ppem_tests {
         let Some(mut e) = engine_or_skip() else {
             return;
         };
-        let bytes = {
-            let source = e.source.as_ref().expect("the test engine carries a chain");
-            let chain = source.chain.lock_recover();
-            chain.read(TEST_FACES[2]).expect("MORPHEUS is in the chain")
+        let Some(bytes) = a_present_client_font(&e) else {
+            eprintln!("skipping: no client TTF in the chain");
+            return;
         };
         let root = std::env::temp_dir().join(format!("benilla-addon-font-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1200,10 +1663,9 @@ mod ppem_tests {
         let Some(mut e) = engine_or_skip() else {
             return;
         };
-        let bytes = {
-            let source = e.source.as_ref().expect("the test engine carries a chain");
-            let chain = source.chain.lock_recover();
-            chain.read(TEST_FACES[2]).expect("MORPHEUS is in the chain")
+        let Some(bytes) = a_present_client_font(&e) else {
+            eprintln!("skipping: no client TTF in the chain");
+            return;
         };
         let root =
             std::env::temp_dir().join(format!("benilla-addon-outline-{}", std::process::id()));
@@ -1221,9 +1683,13 @@ mod ppem_tests {
         let ppem = e.ppem(18.0);
         e.ensure_str(face, ppem, 0, "6");
         e.ensure_str(face, ppem, 1, "6");
-        let g = e.char_cell(face, ppem, '6').expect("shaped").glyphs[0].glyph_id;
-        let plain = e.cell(face, ppem, 0, g).expect("a plain cell");
-        let ringed = e.cell(face, ppem, 1, g).expect("an outlined cell");
+        // Keyed by the face that actually shaped: the addon copy carries the same family name as
+        // the client face it was copied from, so the shaper may answer with either.
+        let cell = e.char_cell(face, ppem, '6').expect("shaped");
+        let id = cell.font_id;
+        let g = cell.glyphs[0].glyph_id;
+        let plain = e.cell_in(id, ppem, 0, g).expect("a plain cell");
+        let ringed = e.cell_in(id, ppem, 1, g).expect("an outlined cell");
         // `dpi` is 1 here, so NORMAL is one dilation pass: `pad` = 1 texel every side.
         assert_eq!(
             (ringed.px_w, ringed.px_h),
@@ -1237,7 +1703,7 @@ mod ppem_tests {
         );
         // THICK is two passes and a third cell.
         e.ensure_str(face, ppem, 2, "6");
-        let thick = e.cell(face, ppem, 2, g).expect("a THICK cell");
+        let thick = e.cell_in(id, ppem, 2, g).expect("a THICK cell");
         assert_eq!(
             (thick.px_w, thick.px_h),
             (plain.px_w + 4.0, plain.px_h + 4.0)

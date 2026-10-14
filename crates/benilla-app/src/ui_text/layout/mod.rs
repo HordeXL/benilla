@@ -281,7 +281,9 @@ fn layout_text_quads_inner(
                     color[3] *= gradient_alpha(char_index, start, length);
                 }
                 for g in &cc.glyphs {
-                    if let Some(info) = e.cell(r.face, r.ppem, r.radius, g.glyph_id) {
+                    // The cell is keyed by the face the character shaped in, which is the CJK
+                    // fallback's for a character the requested face cannot draw.
+                    if let Some(info) = e.cell_in(cc.font_id, r.ppem, r.radius, g.glyph_id) {
                         pending.push(PendingGlyph {
                             x_dev: pen_dev + info.bearing_x,
                             y_dev: g.y_off - info.bearing_top,
