@@ -15,7 +15,7 @@
 //! A logout or a later `SMSG_CHARACTER_LOGIN_FAILED` ends the world session, announced as a
 //! [`SessionEvent::Disconnected`] with [`SessionEnd::LoggedOut`], and parks at character select
 //! again on the same link. A stream failure emits it with [`SessionEnd::Lost`] and re-parks for
-//! credentials. All policy lives in [`crate::login`] and [`crate::char_select`]; this thread only
+//! credentials. All policy lives in [`crate::glue_session`]; this thread only
 //! sequences and never sleeps.
 //!
 //! One long-lived write thread drains [`ClientCommand`](super::ClientCommand)s; each world entry
@@ -30,7 +30,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use benilla_assets::LockRecover;
 use benilla_protocol::{
-    messages, AuthReject, CharAction, LoginStage, Poll, RosterCause, SessionEnd, SessionEvent,
+    messages::{self, SurveyAnswer},
+    AuthReject, CharAction, LoginStage, Poll, RosterCause, SessionEnd, SessionEvent,
     WardenRequired, WorldReader, WorldSession, WorldWriter,
 };
 use crossbeam_channel::{Receiver, Sender};
@@ -74,6 +75,8 @@ pub(crate) struct LoginRequest {
     /// The realmlist to dial, `host[:port]`, per attempt so an edit mid-dial cannot retarget the
     /// connection in flight.
     pub(crate) host: String,
+    /// The locale tag the logon challenge carries ([`crate::ui_script::client_locale`]).
+    pub(crate) locale: u32,
     pub(crate) generation: u64,
 }
 
@@ -418,7 +421,7 @@ fn query(
 ) -> bool {
     let mut ok = logon.refresh_realms(REALM_REFRESH_TIMEOUT);
     if !ok {
-        match benilla_protocol::logon(&req.host, &req.user, &req.pass) {
+        match benilla_protocol::logon(&req.host, &req.user, &req.pass, req.locale) {
             Ok(fresh) => {
                 *logon = fresh;
                 ok = true;
@@ -519,7 +522,7 @@ fn run(
 
         // Logon: the dial and the SRP6 exchange against realmd.
         stage(LoginStage::Connecting);
-        let mut logon = match benilla_protocol::logon(&req.host, &req.user, &req.pass) {
+        let mut logon = match benilla_protocol::logon(&req.host, &req.user, &req.pass, req.locale) {
             Ok(l) => l,
             Err(e) => {
                 if canceled() {
@@ -1530,6 +1533,26 @@ pub(super) fn writer_loop(
                         w.gm_ticket_updatetext(category, &text)
                     }
                     ClientCommand::GmTicketGet => w.gm_ticket_get(),
+                    ClientCommand::SkillBuyStep { skill_id } => w.skill_buy_step(skill_id),
+                    ClientCommand::LotteryQuery => w.lottery_query(),
+                    ClientCommand::BuyLotteryTicket { first, second } => {
+                        w.buy_lottery_ticket(first, second)
+                    }
+                    ClientCommand::GmSurveySubmit {
+                        survey,
+                        answers,
+                        comment,
+                    } => {
+                        let answers: Vec<_> = answers
+                            .iter()
+                            .map(|(question, rating, comment)| SurveyAnswer {
+                                question: *question,
+                                rating: *rating,
+                                comment,
+                            })
+                            .collect();
+                        w.gm_survey_submit(survey, &answers, &comment)
+                    }
                     ClientCommand::GmTicketDelete => w.gm_ticket_delete(),
                     ClientCommand::GmTicketSystemStatus => w.gm_ticket_system_status(),
                     ClientCommand::BinderActivate { binder } => w.binder_activate(binder),
@@ -1840,6 +1863,9 @@ pub(super) fn writer_loop(
                     ClientCommand::AddFriend { name } => w.add_friend(&name),
                     ClientCommand::SetLookingForGroup { slots, comment } => {
                         w.set_looking_for_group(slots, &comment)
+                    }
+                    ClientCommand::LfgQuery { criterion, class } => {
+                        w.looking_for_group_query(criterion, class)
                     }
                     ClientCommand::DelFriend { guid } => w.del_friend(guid),
                     ClientCommand::AddIgnore { name } => w.add_ignore(&name),

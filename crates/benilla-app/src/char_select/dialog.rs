@@ -9,7 +9,7 @@ use crate::textinput::{self, HostClipboard};
 use bevy::prelude::*;
 
 use crate::glue::art::{tc_rect, GlueArt, GOLD};
-use crate::glue::backdrop::{backdrop_border, tiled_bg_node};
+use crate::glue::backdrop::{backdrop_border, tiled_bg};
 use crate::glue::widgets::{
     caret_bar, glue_button, outlined_text, overlay, paint_glue_field, GlueBtnKind, GlueDisabled,
     GlueFieldPart, GlueText,
@@ -25,7 +25,7 @@ use super::wow_font;
 pub(super) struct DeleteDialog {
     pub(super) open: bool,
     /// The snapshotted target: guid, name, level, class name.
-    target: Option<(u64, String, u8, &'static str)>,
+    target: Option<(u64, String, u8, String)>,
     /// The confirm box's text; the reference's `letters="32"` cap is its `max_letters`.
     pub(super) typed: EditBoxState,
     /// The spawned dialog root, while up.
@@ -35,9 +35,9 @@ pub(super) struct DeleteDialog {
 }
 
 impl DeleteDialog {
-    pub(super) fn open_for(&mut self, guid: u64, name: String, level: u8, class: &'static str) {
+    pub(super) fn open_for(&mut self, guid: u64, name: String, level: u8, class: &str) {
         self.open = true;
-        self.target = Some((guid, name, level, class));
+        self.target = Some((guid, name, level, class.to_string()));
         self.typed.set_text("");
     }
 
@@ -204,7 +204,7 @@ fn spawn_dialog(
     let (name, level, class) = dialog
         .target
         .as_ref()
-        .map(|(_, n, l, c)| (n.clone(), *l, *c))
+        .map(|(_, n, l, c)| (n.clone(), *l, c.clone()))
         .unwrap_or_default();
     // `CONFIRM_CHAR_DELETE`'s `|cffffffff` span splits it: gold lead above, white identity below.
     let raw = strings.text(
@@ -214,7 +214,7 @@ fn spawn_dialog(
     let filled = raw
         .replacen("%s", &name, 1)
         .replacen("%d", &level.to_string(), 1)
-        .replacen("%s", class, 1);
+        .replacen("%s", &class, 1);
     let (lead, identity) = match filled.split_once("|cffffffff") {
         Some((a, b)) => (a.trim_end_matches('\n').to_string(), b.replace("|r", "")),
         None => (filled.clone(), String::new()),
@@ -223,7 +223,6 @@ fn spawn_dialog(
     commands
         .spawn((
             DialogUi,
-            crate::glue::NativeGlue,
             GlobalZIndex(1200), // over the select screen's 1100
             Node {
                 width: Val::Percent(100.0),
@@ -242,16 +241,12 @@ fn spawn_dialog(
             boxed.with_children(|b| {
                 // Background tiled at 32 inside insets (11,12,12,11), the 32-edge border over it.
                 if let (Some(bg), Some(border)) = (&art.dialog_bg, &art.dialog_border) {
-                    b.spawn((
-                        tiled_bg_node(bg.clone(), 32.0, s, Color::WHITE),
-                        Node {
-                            position_type: PositionType::Absolute,
-                            left: px(11.0),
-                            right: px(12.0),
-                            top: px(12.0),
-                            bottom: px(11.0),
-                            ..default()
-                        },
+                    b.spawn(tiled_bg(
+                        bg.clone(),
+                        32.0,
+                        (11.0, 12.0, 12.0, 11.0),
+                        s,
+                        Color::WHITE,
                     ));
                     backdrop_border(b, border, 32.0, Color::WHITE);
                 } else {

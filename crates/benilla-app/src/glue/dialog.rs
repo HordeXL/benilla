@@ -13,7 +13,7 @@ use bevy::prelude::*;
 use benilla_ui::widget::EditBoxState;
 
 use crate::glue::art::{GlueArt, GOLD};
-use crate::glue::backdrop::{backdrop_border, tiled_bg_node};
+use crate::glue::backdrop::{backdrop_border, tiled_bg};
 use crate::glue::widgets::{
     glue_button, glue_edit_box, outlined_text_centered, overlay, paint_glue_field, GlueBtnKind,
     GlueFieldPart, GlueText,
@@ -104,7 +104,7 @@ pub(crate) struct GlueDialog {
     /// `GlueDialogEditBox`, rebuilt on every open so a cancelled edit leaves nothing behind.
     pub(crate) edit: EditBoxState,
     /// The queue's sample ring and realm, live while [`DialogKind::Queued`] is up.
-    pub(crate) queue: crate::login::queue::QueueEstimate,
+    pub(crate) queue: crate::glue_session::queue::QueueEstimate,
     pub(crate) queue_realm: Option<String>,
     spawned: Option<DialogKind>,
     /// The glue scale the spawned tree was built at; a resize rebuilds it.
@@ -131,7 +131,7 @@ impl GlueDialog {
     /// `realm` feeds the `_NAME` text variants.
     pub(crate) fn open_queued(&mut self, realm: Option<String>) {
         self.kind = Some(DialogKind::Queued);
-        self.queue = crate::login::queue::QueueEstimate::default();
+        self.queue = crate::glue_session::queue::QueueEstimate::default();
         self.queue_realm = realm;
         self.set_text("");
     }
@@ -196,7 +196,6 @@ pub(crate) fn spawn_dialog(
     let (caption, caption2) = kind.buttons(strings);
     commands
         .spawn((
-            super::NativeGlue,
             GlobalZIndex(1200), // over the screen's 1100
             Node {
                 width: Val::Percent(100.0),
@@ -218,16 +217,12 @@ pub(crate) fn spawn_dialog(
             boxed.with_children(|b| {
                 // Backdrop: bg tiled at 32 inside (11,12,12,11), the 32-edge border over it.
                 if let (Some(bg), Some(border)) = (&art.dialog_bg, &art.dialog_border) {
-                    b.spawn((
-                        tiled_bg_node(bg.clone(), 32.0, s, Color::WHITE),
-                        Node {
-                            position_type: PositionType::Absolute,
-                            left: px(11.0),
-                            right: px(12.0),
-                            top: px(12.0),
-                            bottom: px(11.0),
-                            ..default()
-                        },
+                    b.spawn(tiled_bg(
+                        bg.clone(),
+                        32.0,
+                        (11.0, 12.0, 12.0, 11.0),
+                        s,
+                        Color::WHITE,
                     ));
                     backdrop_border(b, border, 32.0, Color::WHITE);
                 } else {

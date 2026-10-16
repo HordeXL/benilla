@@ -10,8 +10,8 @@
 
 use bevy::prelude::*;
 
-use crate::char_select::ClientState;
-use benilla_assets::{LockRecover, WorldAssets};
+use crate::client_state::ClientState;
+use benilla_assets::WorldAssets;
 
 use super::kit::{self, KitRef, SoundCategory, SoundKits};
 use super::{mixer, SoundConfig, SoundOutput};
@@ -32,7 +32,7 @@ const GLUE_MUSIC_FADE_OUT_MS: u64 = 3000;
 pub(crate) struct GlueSound(pub(crate) &'static str);
 
 /// The stock glue screens' music verbs, which drive the theme in place of the native screens'
-/// start-on-entry under `WOW_GLUE_STOCK=1`.
+/// start-on-entry.
 #[derive(Message, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum GlueMusicRequest {
     /// `PlayGlueMusic(file)` (`0x45aeb0`): the same file still streaming plays on; another stops
@@ -169,7 +169,8 @@ fn start_glue_music(
     open_glue_music(&mut music, &mut out, assets.as_deref(), &config, GLUE_MUSIC);
 }
 
-/// Open `file` off the chain as a stream at `amp` (the category's slider already multiplied in).
+/// Open `file` off the loose files or the chain as a stream at `amp` (the category's slider
+/// already multiplied in).
 fn open_stream(
     out: &mut SoundOutput,
     assets: Option<&WorldAssets>,
@@ -179,10 +180,10 @@ fn open_stream(
     let (Some(assets), Some(mixer_ref)) = (assets, out.mixer.as_mut()) else {
         return None;
     };
-    let bytes = {
-        let chain = assets.chain.lock_recover();
-        chain.read(file)
-    };
+    // Every file FMOD opens is a loose-flagged open (`0x7a8860`).
+    let bytes = assets
+        .read_file_or_loose(file)
+        .ok_or_else(|| anyhow::anyhow!("not in the loose files or the patch chain"));
     let data = match bytes.and_then(mixer::stream_from_bytes) {
         Ok(d) => d,
         Err(e) => {

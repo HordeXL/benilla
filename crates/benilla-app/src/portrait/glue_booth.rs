@@ -700,6 +700,7 @@ pub(crate) struct PreviewEffects {
     pub(crate) bone: u16,
     pub(crate) offset: Vec3,
     pub(crate) emitters: Vec<benilla_assets::ModelEmitter>,
+    pub(crate) rig: Option<super::EffectRig>,
 }
 
 /// The select screen's ghost treatment of the body, applied by the reference at `0x4727f0` for a
@@ -798,27 +799,8 @@ pub(super) fn spawn_glue_booth(
     ));
     booths.0.insert(
         GLUE_SLOT.to_string(),
-        Booth {
-            layer: layer.clone(),
-            root,
-            target: image,
-            baked: None,
-            baked_guid: None,
-            snap: None,
-            shown: false,
-            show_rev: 0,
-            // `gate_booth_cameras` keeps the glue camera live while a scene shows.
-            wake: 0,
-            live: false,
-            pending: Vec::new(),
-            pending_since: None,
-            pipes_settling: false,
-            pipes_since: None,
-            aspect: 1.0,
-            rigged: false,
-            parked: false,
-            turn: super::Turn::default(),
-        },
+        // `gate_booth_cameras` keeps the glue camera live while a scene shows.
+        Booth::new(layer.clone(), root, image),
     );
     // The background scene's own root; the character root yaws, this one never does.
     let scene_root = commands.spawn(stage_root(&layer)).id();
@@ -1718,6 +1700,7 @@ pub(super) fn sync_glue_booth(
                 bone: fx.bone,
                 offset: fx.offset,
                 emitters: fx.emitters.clone(),
+                rig: fx.rig.clone(),
             })
             .collect();
         let hung = Hung::of(
@@ -2357,7 +2340,7 @@ mod tests {
             .add_systems(Update, sync_glue_ffx);
         let mut ghost = benilla_protocol::Character {
             flags: benilla_protocol::CHARACTER_FLAG_GHOST,
-            ..crate::char_select::test_character(1, "Boo")
+            ..crate::glue_session::roster::test_character(1, "Boo")
         };
         let set = |app: &mut App, look: Option<GlueLook>, show: bool| {
             {
@@ -2762,26 +2745,7 @@ mod tests {
 
     /// The glue booth over the character root `root`, as [`spawn_glue_booth`] stands it.
     fn glue_booth(root: Entity) -> Booth {
-        Booth {
-            layer: RenderLayers::layer(GLUE_LAYER),
-            root,
-            target: Handle::default(),
-            baked: None,
-            baked_guid: None,
-            snap: None,
-            shown: false,
-            show_rev: 0,
-            wake: 0,
-            live: false,
-            pending: Vec::new(),
-            pending_since: None,
-            pipes_settling: false,
-            pipes_since: None,
-            aspect: 1.0,
-            rigged: false,
-            parked: false,
-            turn: super::super::Turn::default(),
-        }
+        Booth::new(RenderLayers::layer(GLUE_LAYER), root, Handle::default())
     }
 
     fn booth_app() -> (App, Entity) {
@@ -3002,9 +2966,9 @@ mod tests {
     fn another_select_record_is_another_model() {
         let (mut app, root) = booth_app();
         let record = |guid| {
-            GlueLook::Select(SelectLook::from(&crate::char_select::test_character(
-                guid, "Rec",
-            )))
+            GlueLook::Select(SelectLook::from(
+                &crate::glue_session::roster::test_character(guid, "Rec"),
+            ))
         };
         bake(
             &mut app,

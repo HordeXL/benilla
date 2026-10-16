@@ -34,7 +34,7 @@ use cosmic_text::{
 use benilla_assets::{LockRecover, WorldAssets};
 
 use faces::{hhea_ascent_ratio, register_font, CLIENT_FONTS};
-pub(crate) use gpu::UiTextPlugin;
+pub(crate) use gpu::{FontAtlasInit, UiTextPlugin};
 
 use super::outline::outlined_cell;
 use super::pack::{Cell, Sheet};
@@ -124,11 +124,12 @@ struct CacheStats {
 
 // ── The engine ──
 
-/// The two stores a font path can come from: the patch chain, then the AddOns folder.
+/// The stores a font path can come from: the loose files, then the patch chain.
 struct FontSource {
     chain: Arc<Mutex<benilla_formats::Chain>>,
-    /// `ui_script::addons::root()`; `None` under `$WOW_CAPTURE`, which keeps a capture hermetic.
-    loose_root: Option<std::path::PathBuf>,
+    /// The install's index and `ui_script::addons::root()`, whose folder is `None` under
+    /// `$WOW_CAPTURE`, which keeps a capture hermetic.
+    loose: benilla_assets::LooseFiles,
 }
 
 /// The font engine: faces, the two caches, and the texture sheet.
@@ -140,8 +141,13 @@ pub(crate) struct TextEngine {
     path_to_face: HashMap<String, usize>,
     /// Where an unmapped face is read from; `None` only in a VM with no install.
     source: Option<FontSource>,
-    /// Paths that failed to load, read and warned once; a font file does not appear mid-session.
+    /// Paths that failed to load, read and warned once, until the install's index is emptied
+    /// ([`Self::loose_generation`]).
     missing_fonts: HashSet<String>,
+    /// The install index's generation [`Self::missing_fonts`] was filled under: a font added loose
+    /// is found after the index is rebuilt (a `ReloadUI`, a logout), and not before. A face already
+    /// loaded stays, as the client faces load once.
+    loose_generation: u64,
     default_face: usize,
     /// The face a character the requested one cannot draw falls back to, discovered from the
     /// install ([`faces::cjk_fallback_face`]); `None` on an install whose client faces cover the
@@ -244,25 +250,42 @@ fn load_fallback_face(
 }
 
 impl TextEngine {
-    /// Register the client TTFs off the install — the player's `Fonts\` folder first, then the
-    /// archives; `None`, and no text, without Friz Quadrata.
+    /// Register the client TTFs, each read as a font face opens ([`read_font_bytes`]); `None`, and
+    /// no text, without Friz Quadrata.
     fn load(world_assets: &WorldAssets, images: &Assets<Image>, dpi: f32) -> Option<Self> {
         let mut font_system = client_font_system();
         let mut faces: Vec<Face> = Vec::new();
         let mut path_to_face = HashMap::new();
-        // The player's `Fonts\` folder first, the archives second ([`WorldAssets::read_font`]): a
-        // player who replaced `FRIZQT__` there means it, and the archives may carry no CJK face at
-        // all while the loose folder does.
-        let read = |path: &str| match world_assets.read_font(path) {
-            Some(bytes) => Some(bytes),
-            None => {
-                warn!("ui_text: failed to read {path} from the install");
-                None
-            }
+        let source = FontSource {
+            chain: world_assets.chain.clone(),
+            loose: benilla_assets::LooseFiles {
+                addons: crate::ui_script::addons::root(),
+                ..world_assets.loose().clone()
+            },
         };
         for &path in CLIENT_FONTS {
-            let Some(bytes) = read(path) else { continue };
-            register_face(&mut font_system, &mut faces, &mut path_to_face, path, bytes);
+            let Some(bytes) = read_font_bytes(&source, path) else {
+                warn!("ui_text: failed to read {path} from the loose files or the patch chain");
+                continue;
+            };
+            let ascent_ratio = hhea_ascent_ratio(&bytes).unwrap_or(0.794);
+            let sfnt = sfnt::Sfnt::parse(bytes.clone()).map(Arc::new);
+            match register_font(&mut font_system, bytes) {
+                Ok(r) => {
+                    path_to_face.insert(path.to_ascii_lowercase(), faces.len());
+                    faces.push(Face {
+                        id: r.id,
+                        path: path.to_string(),
+                        family: r.family,
+                        weight: r.weight,
+                        style: r.style,
+                        stretch: r.stretch,
+                        ascent_ratio,
+                        sfnt,
+                    });
+                }
+                Err(e) => warn!("ui_text: failed to register {path}: {e:#}"),
+            }
         }
         // The chain's union of every archive's `(listfile)`, where `fonts.MPQ`'s names live: one
         // archive's own listfile (whichever `Chain::read` would resolve) names only its own files.
@@ -277,12 +300,14 @@ impl TextEngine {
                 );
                 Vec::new()
             });
+        // The fallback face is read as the client faces are, so a `Fonts\` replacement carries
+        // Chinese too.
         let fallback_face = load_fallback_face(
             &mut font_system,
             &mut faces,
             &mut path_to_face,
             &listed,
-            &read,
+            &|n: &str| read_font_bytes(&source, n),
         );
         let default_face = *path_to_face.get(&CLIENT_FONTS[0].to_ascii_lowercase())?;
         info!(
@@ -299,11 +324,9 @@ impl TextEngine {
             swash: SwashCache::new(),
             faces,
             path_to_face,
-            source: Some(FontSource {
-                chain: world_assets.chain.clone(),
-                loose_root: crate::ui_script::addons::root(),
-            }),
+            source: Some(source),
             missing_fonts: HashSet::new(),
+            loose_generation: 0,
             default_face,
             fallback_face,
             fallback_noted: false,
@@ -332,6 +355,13 @@ impl TextEngine {
         if let Some(&i) = self.path_to_face.get(&key) {
             return i;
         }
+        let generation = self.source.as_ref().and_then(|s| s.loose.install.as_ref());
+        if let Some(generation) = generation.map(|cell| cell.generation()) {
+            if generation != self.loose_generation {
+                self.loose_generation = generation;
+                self.missing_fonts.clear();
+            }
+        }
         if self.missing_fonts.contains(&key) {
             return self.default_face;
         }
@@ -339,8 +369,8 @@ impl TextEngine {
             Some(i) => i,
             None => {
                 warn!(
-                    "ui_text: font miss: '{p}' does not resolve in the patch chain or the AddOns \
-                     folder — falling back to {}",
+                    "ui_text: font miss: '{p}' does not resolve in the loose files or the patch \
+                     chain — falling back to {}",
                     CLIENT_FONTS[0]
                 );
                 self.missing_fonts.insert(key);
@@ -836,10 +866,16 @@ impl UiFontAtlas {
     }
 }
 
-/// Read one font path by the rule every by-path addon asset follows, chain first
-/// ([`benilla_assets::read_chain_or_loose`]).
+/// Read one font path as a font face opens it (`0x5d0060`, flags 3 at `0x5d0121`): a loose file
+/// by its bare name, then by its whole path, then the chain
+/// ([`benilla_assets::read_loose_or_chain`]).
 fn read_font_bytes(source: &FontSource, path: &str) -> Option<Vec<u8>> {
-    benilla_assets::read_chain_or_loose(&source.chain, source.loose_root.as_deref(), path)
+    benilla_assets::read_loose_or_chain(
+        &source.chain,
+        &source.loose,
+        path,
+        benilla_assets::LooseOpen::BareNameFirst,
+    )
 }
 
 /// A real-font engine for a test, the client faces off the patch chain; `None` without an install
@@ -878,9 +914,10 @@ pub(super) fn test_engine(dpi: f32) -> Option<TextEngine> {
         // The same chain the four client faces were just read from, so a test can ask for a fifth.
         source: Some(FontSource {
             chain: Arc::new(Mutex::new(chain)),
-            loose_root: None,
+            loose: benilla_assets::LooseFiles::default(),
         }),
         missing_fonts: HashSet::new(),
+        loose_generation: 0,
         default_face,
         fallback_face,
         fallback_noted: false,
@@ -1018,6 +1055,8 @@ mod line_law_tests {
                     spacing: 0.0,
                     shadow_x: 0.0,
                     alpha_gradient: None,
+                    non_space_wrap: false,
+                    max_lines: 0,
                 };
                 let got = string_width(&mut e, text, spec, shadow / dpi);
                 assert_eq!(
@@ -1057,6 +1096,8 @@ mod line_law_tests {
                 spacing: 0.0,
                 shadow_x: 0.0,
                 alpha_gradient: None,
+                non_space_wrap: false,
+                max_lines: 0,
             };
             assert_eq!(
                 string_width(&mut e, text, spec, 0.0),
@@ -1287,6 +1328,7 @@ mod differential_tests {
 #[cfg(test)]
 mod ppem_tests {
     use super::*;
+    use benilla_assets::LockRecover;
 
     fn engine_or_skip() -> Option<TextEngine> {
         match test_engine(1.0) {
@@ -1599,7 +1641,7 @@ mod ppem_tests {
         let fonts = root.join("Bolded").join("Fonts");
         std::fs::create_dir_all(&fonts).unwrap();
         std::fs::write(fonts.join("heavy.ttf"), &bytes).unwrap();
-        e.source.as_mut().unwrap().loose_root = Some(root.clone());
+        e.source.as_mut().unwrap().loose.addons = Some(root.clone());
 
         let bold = e.face_for(Some("Interface\\AddOns\\Bolded\\Fonts\\heavy.ttf"));
         assert_ne!(bold, e.default_face, "the bold face registered");
@@ -1614,6 +1656,74 @@ mod ppem_tests {
             "the shaper answered with a different face for a face we named"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A font face opens as `0x5d0060` does, with flags 3: a TTF loose at the top of the install
+    /// answers any path ending in its name, ahead of the path itself and the chain.
+    #[test]
+    fn a_font_loose_in_the_install_answers_by_its_bare_name() {
+        let Some(mut e) = engine_or_skip() else {
+            return;
+        };
+        let bytes = {
+            let source = e.source.as_ref().expect("the test engine carries a chain");
+            let chain = source.chain.lock_recover();
+            chain.read(TEST_FACES[2]).expect("MORPHEUS is in the chain")
+        };
+        let install =
+            std::env::temp_dir().join(format!("benilla-install-font-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&install);
+        std::fs::create_dir_all(install.join("Data")).unwrap();
+        std::fs::write(install.join("Data").join("Custom.TTF"), &bytes).unwrap();
+        let root = install.clone();
+        let cell = benilla_formats::LooseIndexCell::new(move || {
+            benilla_formats::LooseIndex::build(Some(&root), &root.join("Data"))
+        });
+        e.source.as_mut().unwrap().loose.install = Some(Arc::new(cell));
+
+        let face = e.face_for(Some("Interface\\Nowhere\\custom.ttf"));
+        assert_ne!(face, e.face_for(None), "the loose face, not Friz");
+        assert!(e.missing_fonts.is_empty(), "and not recorded as a miss");
+        let _ = std::fs::remove_dir_all(&install);
+    }
+
+    /// A font added loose after a miss stays a miss until the install's index is emptied, then
+    /// loads: the remembered miss goes with the index it was asked of.
+    #[test]
+    fn a_loose_font_added_mid_session_loads_after_the_index_is_emptied() {
+        let Some(mut e) = engine_or_skip() else {
+            return;
+        };
+        let bytes = {
+            let source = e.source.as_ref().expect("the test engine carries a chain");
+            let chain = source.chain.lock_recover();
+            chain.read(TEST_FACES[2]).expect("MORPHEUS is in the chain")
+        };
+        let install =
+            std::env::temp_dir().join(format!("benilla-install-late-font-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&install);
+        std::fs::create_dir_all(install.join("Data")).unwrap();
+        let root = install.clone();
+        let cell = Arc::new(benilla_formats::LooseIndexCell::new(move || {
+            benilla_formats::LooseIndex::build(Some(&root), &root.join("Data"))
+        }));
+        e.source.as_mut().unwrap().loose.install = Some(cell.clone());
+
+        let path = "Fonts\\Late.ttf";
+        assert_eq!(e.face_for(Some(path)), e.face_for(None), "not there yet");
+        std::fs::write(install.join("Data").join("Late.ttf"), &bytes).unwrap();
+        assert_eq!(
+            e.face_for(Some(path)),
+            e.face_for(None),
+            "the built index stays"
+        );
+        cell.clear();
+        assert_ne!(
+            e.face_for(Some(path)),
+            e.face_for(None),
+            "found after the rebuild"
+        );
+        let _ = std::fs::remove_dir_all(&install);
     }
 
     /// An addon's TTF (a copied client face) loads from the AddOns root and registers, requested
@@ -1632,7 +1742,7 @@ mod ppem_tests {
         let fonts = root.join("MikScrollingBattleText").join("Fonts");
         std::fs::create_dir_all(&fonts).unwrap();
         std::fs::write(fonts.join("porky.TTF"), &bytes).unwrap();
-        e.source.as_mut().unwrap().loose_root = Some(root.clone());
+        e.source.as_mut().unwrap().loose.addons = Some(root.clone());
 
         let friz = e.face_for(Some(TEST_FACES[0]));
         let addon = e.face_for(Some(
@@ -1673,7 +1783,7 @@ mod ppem_tests {
         let fonts = root.join("MikScrollingBattleText").join("Fonts");
         std::fs::create_dir_all(&fonts).unwrap();
         std::fs::write(fonts.join("porky.ttf"), &bytes).unwrap();
-        e.source.as_mut().unwrap().loose_root = Some(root.clone());
+        e.source.as_mut().unwrap().loose.addons = Some(root.clone());
 
         let face = e.face_for(Some(
             "Interface\\Addons\\MikScrollingBattleText\\Fonts\\porky.ttf",

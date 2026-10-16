@@ -55,7 +55,7 @@ pub struct Diagnostic {
 }
 
 /// The log, held on the model.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct DiagnosticLog {
     rows: VecDeque<Diagnostic>,
     /// The last `seq` handed out; kept apart from `rows.len()` so eviction never renumbers.
@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn a_warning_reaches_the_retained_log_and_the_host_drain() {
         let mut s = crate::script::UiScript::new().expect("vm");
-        s.run(r#"SetCVar("thisCVarDoesNotExist", "1")"#).unwrap();
+        s.set_cvar_host("thisCVarDoesNotExist", "1");
 
         let host = s.take_warnings();
         assert!(

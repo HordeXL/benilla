@@ -2,6 +2,7 @@
 //! `0x77b8c0` seats the FontString by the insets, and the flush's relayout `0x77d4d0` windows a
 //! single-line box's text and sizes a multi-line box to its text.
 
+use crate::script::TextMeasure as _;
 use mlua::Lua;
 
 use crate::layout::{Anchor, Anchors, Point, Rect};
@@ -230,6 +231,9 @@ pub(super) fn line_height(lua: &Lua, h: FrameHandle, rh: RegionHandle) -> Option
             // One line has no gap: `0x5c2070` charges `(N−1)·gap`.
             spacing: d.line_gap(),
             shadow_x: d.shadow_x(),
+            // One unwrapped line: neither moves its height.
+            non_space_wrap: false,
+            max_lines: 0,
             scale,
             text: ONE_LINE.to_string(),
             key,

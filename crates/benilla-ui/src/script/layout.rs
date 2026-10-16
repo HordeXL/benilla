@@ -225,7 +225,7 @@ const REGION_TAG: u32 = 0x8000_0000;
 /// ([`Model::touch_layout_frame`]), and the next resolve re-derives just those nodes against the
 /// model ([`UiScript::rederive_named`]), joining, leaving or re-pointing them in place, the way a
 /// retained layout tree marks a node dirty rather than rebuilding itself.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct LayoutScope {
     /// Per id: the hash the last converged resolve saw, or [`NO_NODE`]; a mismatch seeds dirty.
     last: Vec<u64>,
@@ -2079,6 +2079,8 @@ pub(super) fn measure_request_for(model: &mut Model, rh: RegionHandle) -> Option
     let outline = d.outline;
     let spacing = d.line_gap();
     let shadow_x = d.shadow_x();
+    let max_lines = d.max_lines;
+    let non_space_wrap = model.non_space_wrap_of(rh);
     let id = model.region_id(rh);
     Some(MeasureRequest {
         id,
@@ -2089,6 +2091,8 @@ pub(super) fn measure_request_for(model: &mut Model, rh: RegionHandle) -> Option
         outline,
         spacing,
         shadow_x,
+        non_space_wrap,
+        max_lines,
         scale,
         text,
         key,

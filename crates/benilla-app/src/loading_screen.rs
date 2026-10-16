@@ -20,7 +20,7 @@ use benilla_formats::{load_loading_screens, LoadingScreenCatalog};
 
 use benilla_assets::LockRecover;
 use benilla_assets::MapCatalogRes;
-use benilla_assets::{AssetSet, WorldAssets};
+use benilla_assets::{AssetSet, LooseOpen, WorldAssets};
 use benilla_world::schedule::WorldStage;
 use benilla_world::terrain_stream::WorldLoadProgress;
 use benilla_world::world_map::CurrentMap;
@@ -104,10 +104,10 @@ impl EntryCover {
 /// `First`: advance or reset the covered-frame count.
 fn count_entry_cover(
     screen: Res<LoadingScreen>,
-    state: Res<State<crate::char_select::ClientState>>,
+    state: Res<State<crate::client_state::ClientState>>,
     mut cover: ResMut<EntryCover>,
 ) {
-    let in_world = *state.get() == crate::char_select::ClientState::InWorld;
+    let in_world = *state.get() == crate::client_state::ClientState::InWorld;
     cover.tick(screen.covering() && in_world);
 }
 
@@ -314,8 +314,9 @@ fn setup_loading_screen(
         }
     }
 
-    // The two layers 1.12 draws, as sRGB clamp sprites.
-    let mut tex = |path: &str| assets.sprite_texture(path, &mut images);
+    // The two layers 1.12 draws, as sRGB clamp sprites, from the archives alone: the loading
+    // screen's `TextureCreate` calls (`0x406891`) pass file flag 0.
+    let mut tex = |path: &str| assets.sprite_texture_opened(path, LooseOpen::Archives, &mut images);
     let Some(border) = tex("Interface\\Glues\\LoadingBar\\Loading-BarBorder.blp") else {
         error!("loading bar textures missing — plain black cover, no art");
         return;
@@ -422,7 +423,7 @@ fn drive_loading_screen(
     // The world-entry UI load runs behind this cover; the reference's reveal always has the UI up.
     entry_ui_pending: Option<Res<crate::ui_script::PendingEntryUiLoad>>,
     edges: (
-        Res<State<crate::char_select::ClientState>>,
+        Res<State<crate::client_state::ClientState>>,
         MessageReader<crate::net::EnteredWorldMessage>,
         MessageReader<crate::net::WorldportMessage>,
         MessageReader<crate::net::TeleportMessage>,
@@ -430,7 +431,7 @@ fn drive_loading_screen(
         MessageReader<crate::net::DisconnectedMessage>,
         MessageReader<crate::net::CharacterLoginFailedMessage>,
         Option<Res<crate::net::PendingTransfer>>,
-        Option<Res<crate::char_select::Roster>>,
+        Option<Res<crate::glue_session::roster::Roster>>,
     ),
 ) {
     let (
@@ -453,7 +454,8 @@ fn drive_loading_screen(
     // --- The edges. ---
     // A glue entry (not the seamless in-world reconnect), raised on the frame the glue tears down
     // and held across the server's character load; the art comes from the roster's map.
-    if entered.read().next().is_some() && *state.get() != crate::char_select::ClientState::InWorld {
+    if entered.read().next().is_some() && *state.get() != crate::client_state::ClientState::InWorld
+    {
         let map = roster.as_ref().and_then(|r| r.pending_map());
         screen.raise("world entry", true, map, now);
         // The tip rides this edge alone: the reference's setter `0x406630` has one caller, in
@@ -504,7 +506,7 @@ fn drive_loading_screen(
             }
         );
     }
-    if screen.blackout && *state.get() != crate::char_select::ClientState::InWorld {
+    if screen.blackout && *state.get() != crate::client_state::ClientState::InWorld {
         // The glue is up (it renders above this root); the cover's job is done.
         screen.dismiss();
     }
@@ -517,7 +519,7 @@ fn drive_loading_screen(
         && !progress.focus_resident
         && focus.follows_body()
         && !player_settling
-        && *state.get() == crate::char_select::ClientState::InWorld
+        && *state.get() == crate::client_state::ClientState::InWorld
     {
         // Same map by construction: the ground under the body.
         screen.raise("focus not resident", false, map_id, now);
@@ -613,9 +615,12 @@ fn drive_loading_screen(
                 .map(str::to_string);
             let handle = path.and_then(|path| match screen.art_cache.get(&path) {
                 Some(h) => Some(h.clone()),
-                None => assets.sprite_texture(&path, &mut images).inspect(|h| {
-                    screen.art_cache.insert(path.clone(), h.clone());
-                }),
+                // `ResolveLoadingArt` opens the art with file flag 0 (`0x406eba`, `0x406ef1`).
+                None => assets
+                    .sprite_texture_opened(&path, LooseOpen::Archives, &mut images)
+                    .inspect(|h| {
+                        screen.art_cache.insert(path.clone(), h.clone());
+                    }),
             });
             match (handle, backdrop.single_mut()) {
                 (Some(handle), Ok((mut img, _))) => {
@@ -774,7 +779,7 @@ mod tests {
         player.pos = benilla_assets::coords::wow_to_bevy(at);
         let mut app = App::new();
         app.add_plugins((MinimalPlugins, bevy::state::app::StatesPlugin))
-            .insert_state(crate::char_select::ClientState::InWorld)
+            .insert_state(crate::client_state::ClientState::InWorld)
             .add_message::<crate::net::EnteredWorldMessage>()
             .add_message::<crate::net::WorldportMessage>()
             .add_message::<crate::net::TeleportMessage>()

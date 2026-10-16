@@ -1212,6 +1212,7 @@ fn shipped_bag_frame_drives_end_to_end() {
             duration_ms: None,
             petition: None,
             already_bound: false,
+            occupied_seats: None,
             bonding: 0,
             use_spell: 0,
             bar_placeable: true,
@@ -1228,8 +1229,10 @@ fn shipped_bag_frame_drives_end_to_end() {
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
             flags: 0,
             enchants: Vec::new(),
+            spell_0: false,
         },
     );
     s.set_container(

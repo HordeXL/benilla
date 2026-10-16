@@ -29,14 +29,14 @@ fn chat() -> UiScript {
     )
     .unwrap();
     s.resolve();
-    set_link(&mut s);
+    set_link(&mut s, "CF");
     s
 }
 
-fn set_link(s: &mut UiScript) {
-    let cf = s.model_ref().arena.lookup("CF").expect("CF");
+fn set_link(s: &mut UiScript, owner: &str) {
+    let owner = s.model_ref().arena.lookup(owner).expect("owner");
     s.set_link_spans(vec![(
-        cf,
+        owner,
         Rect::new(120.0, 110.0, 134.0, 160.0),
         LINK.to_string(),
         MARKUP.to_string(),
@@ -138,5 +138,137 @@ fn a_hittable_body_title_drags_but_its_link_still_clicks() {
     s.resolve();
     assert_eq!(s.eval::<f64>("return CF:GetLeft()").unwrap(), 150.0);
     assert!(s.eval::<bool>("return CF:IsUserPlaced()").unwrap());
+    assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
+/// The take `0x7a3880` is called from the ScrollingMessageFrame and SimpleHTML updates alone; the
+/// MessageFrame's update (`0x786200`) reaches neither, so a span on one builds no button and the
+/// pointer over it passes through.
+#[test]
+fn a_message_frame_line_gets_no_link_button() {
+    let mut s = script();
+    s.set_screen_size(800.0, 600.0);
+    s.run(
+        r#"
+        EF = CreateFrame("MessageFrame", "EF")
+        EF:SetPoint("BOTTOMLEFT", 100, 100); EF:SetWidth(430); EF:SetHeight(120)
+        "#,
+    )
+    .unwrap();
+    s.resolve();
+    set_link(&mut s, "EF");
+    assert_eq!(s.eval::<i64>("return EF:GetNumChildren()").unwrap(), 0);
+    s.mouse_move(130.0, 127.0);
+    assert!(s.eval::<bool>("return GetMouseFocus() == nil").unwrap());
+    assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
+fn set_spans_at(s: &mut UiScript, link: &str, dx: f32) {
+    let cf = s.model_ref().arena.lookup("CF").expect("CF");
+    s.set_link_spans(vec![(
+        cf,
+        Rect::new(120.0, 110.0 + dx, 134.0, 160.0 + dx),
+        link.to_string(),
+        format!("|H{link}|h[x]|h"),
+    )]);
+}
+
+fn log_hover(s: &mut UiScript) {
+    s.run(
+        r#"
+        CF:SetScript("OnHyperlinkEnter", function() table.insert(log, "enter:"..arg1) end)
+        CF:SetScript("OnHyperlinkLeave", function() table.insert(log, "leave:"..arg1) end)
+        "#,
+    )
+    .unwrap();
+}
+
+/// The rebuild (`0x788c00`) compares nothing: a relayout with the same spans, here a scroll down
+/// refused at the bottom (`0x788650` → `0x788b80`, flag at `0x788bf1`), still hides the hovered
+/// button (`0x7a3920`), which leaves, and the re-placed one enters on the next pick. The span
+/// arriving with no flag up rebuilds nothing.
+#[test]
+fn a_relayout_with_the_same_spans_leaves_and_re_enters_the_hovered_link() {
+    let mut s = chat();
+    log_hover(&mut s);
+    s.mouse_move(130.0, 127.0);
+    set_link(&mut s, "CF");
+    assert_eq!(log_of(&s), format!("enter:{LINK}"), "no flag: no rebuild");
+    s.run("CF:ScrollDown()").unwrap();
+    set_link(&mut s, "CF");
+    s.mouse_move(131.0, 127.0);
+    assert_eq!(
+        log_of(&s),
+        format!("enter:{LINK} leave:{LINK} enter:{LINK}")
+    );
+    assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
+/// A new line's relayout under a hovered link: the leave carries the link it entered with, and
+/// the button that takes the new span enters afresh.
+#[test]
+fn a_new_line_leaves_the_hovered_link_with_its_old_link() {
+    let mut s = chat();
+    log_hover(&mut s);
+    s.mouse_move(130.0, 127.0);
+    s.run("CF:AddMessage('x')").unwrap();
+    set_spans_at(&mut s, "item:2589", 0.0);
+    s.mouse_move(131.0, 127.0);
+    s.mouse_move(300.0, 150.0);
+    assert_eq!(
+        log_of(&s),
+        format!("enter:{LINK} leave:{LINK} enter:item:2589 leave:item:2589")
+    );
+    assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
+/// A frame that only moves carries its buttons along (`0x7a3441` anchors them to the line): no
+/// leave, no enter, and the button under the cursor is the same one.
+#[test]
+fn a_moved_frame_carries_its_buttons_with_no_leave_or_enter() {
+    let mut s = chat();
+    log_hover(&mut s);
+    s.mouse_move(130.0, 127.0);
+    let before = s.eval::<mlua::Value>("return GetMouseFocus()").unwrap();
+    set_spans_at(&mut s, LINK, 5.0);
+    s.mouse_move(131.0, 127.0);
+    assert_eq!(log_of(&s), format!("enter:{LINK}"));
+    let after = s.eval::<mlua::Value>("return GetMouseFocus()").unwrap();
+    assert_eq!(before, after, "the same button");
+    assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
+/// A rescale changes the frame's on-screen size, which its rect callback compares
+/// (`0x788394`), so it relayouts and rebuilds: the hovered link leaves and enters again, though
+/// its span is where it was.
+#[test]
+fn a_rescaled_frame_rebuilds_its_buttons() {
+    let mut s = chat();
+    log_hover(&mut s);
+    s.mouse_move(130.0, 127.0);
+    s.run("CF:SetScale(0.9)").unwrap();
+    s.resolve();
+    set_link(&mut s, "CF");
+    s.mouse_move(131.0, 127.0);
+    assert_eq!(
+        log_of(&s),
+        format!("enter:{LINK} leave:{LINK} enter:{LINK}")
+    );
+    assert!(s.errors().is_empty(), "{:?}", s.errors());
+}
+
+/// A press held over a link through a rebuild loses its capture with the hide, so the release
+/// clicks nothing; the next press and release click the new link.
+#[test]
+fn a_rebuild_under_a_held_press_drops_the_click() {
+    let mut s = chat();
+    s.mouse_move(130.0, 127.0);
+    s.mouse_button(130.0, 127.0, "LeftButton", true);
+    s.run("CF:AddMessage('x')").unwrap();
+    set_spans_at(&mut s, "item:2589", 0.0);
+    s.mouse_button(130.0, 127.0, "LeftButton", false);
+    assert_eq!(log_of(&s), "");
+    click(&mut s, (130.0, 127.0), "LeftButton");
+    assert_eq!(log_of(&s), "click:item:2589#|Hitem:2589|h[x]|h#LeftButton");
     assert!(s.errors().is_empty(), "{:?}", s.errors());
 }

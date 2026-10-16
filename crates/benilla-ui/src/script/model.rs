@@ -15,19 +15,20 @@ use super::{
 // ── The Rust-side model ──
 
 /// The host's answer to whether a texture path resolves to a file.
-pub type TextureProbe = Box<dyn Fn(&str) -> bool>;
+pub type TextureProbe = std::rc::Rc<dyn Fn(&str) -> bool>;
 
 /// The host's world-to-map projection (`0x4a7360`): the displayed map's selection as
 /// [`super::UiScript::world_map_selection`] reads it, a map id and a world `(x, y)`, to the map UV,
 /// `None` where the reference's outputs stay at their `(0, 0)`.
-pub type WorldLocProjector =
-    Box<dyn Fn((u32, u32, Option<u32>), u32, f32, f32) -> Option<(f32, f32)>>;
+pub type WorldLocProjector = std::rc::Rc<WorldLocFn>;
+pub type WorldLocFn = dyn Fn((u32, u32, Option<u32>), u32, f32, f32) -> Option<(f32, f32)>;
 
 /// The host's answer to a texture path's size in texels.
-pub type TextureSizeProbe = Box<dyn Fn(&str) -> Option<(u32, u32)>>;
+pub type TextureSizeProbe = std::rc::Rc<TextureSizeFn>;
+pub type TextureSizeFn = dyn Fn(&str) -> Option<(u32, u32)>;
 
 /// The host's answer to whether a font path loads.
-pub type FontProbe = Box<dyn Fn(&str) -> bool>;
+pub type FontProbe = std::rc::Rc<dyn Fn(&str) -> bool>;
 
 /// Minted id to handle, indexed directly: ids are dense and every scripted call looks one up.
 #[derive(Debug, Clone)]
@@ -85,6 +86,7 @@ pub(crate) fn node_deferred(
 
 /// The Rust-side model behind the Lua VM, in `lua.app_data`. It holds no mlua handles, whose
 /// persistent count the vendored `LUAI_MAXCSTACK` caps.
+#[derive(Clone)]
 pub(crate) struct Model {
     /// Which FrameScript state this VM is: it picks the event table and the frame types.
     pub(crate) vm: super::glue::VmKind,
@@ -106,7 +108,7 @@ pub(crate) struct Model {
     /// The host's reader for chain-sourced addon files; without one such an addon is `MISSING`.
     pub(crate) addons_chain_reader: Option<super::addon::SharedChainReader>,
     /// The host's font engine, so a metric answers inside the asking call, not a frame later.
-    pub(crate) measurer: Option<Box<dyn super::TextMeasure>>,
+    pub(crate) measurer: Option<super::measure::SharedMeasurer>,
     /// Whether a texture path resolves (patch chain or loose addon file), so the path form of
     /// `SetTexture` returns the reference's 1 or nil inline (`0x79bb40`). `None` answers nil.
     pub(crate) texture_probe: Option<TextureProbe>,
@@ -223,9 +225,8 @@ pub(crate) struct Model {
     pub(crate) layout_last_scope: (usize, usize),
     /// Fixpoint rounds run across all solves.
     pub(crate) layout_rounds: u64,
-    /// Per text frame, its pool of hyperlink buttons (`[+0x314]`), the shown ones first
-    /// ([`super::hyperlink`]).
-    pub(crate) link_buttons: HashMap<FrameHandle, Vec<FrameHandle>>,
+    /// Per text frame, its hyperlink buttons, live and free ([`super::hyperlink::LinkPool`]).
+    pub(crate) link_buttons: HashMap<FrameHandle, super::hyperlink::LinkPool>,
     /// Region visuals (texture, colour, text) and layout (anchors, size, justify).
     pub(crate) region_data: HashMap<RegionHandle, RegionData>,
     /// The textures the regions' slots hold, with their creation stamps ([`super::texel`]).
@@ -349,6 +350,12 @@ pub(crate) struct Model {
     /// [`super::UnitGuids::chain_ends`]: a token with a hop that no push names reads its
     /// resolved guid's entry here.
     pub(crate) units_by_guid: HashMap<u64, UnitState>,
+    /// Every unit `TargetByName` can pick, by guid, as the app's by-name scan sees it this frame:
+    /// the binding resolves against it so the rest of its chunk reads the new selection.
+    pub(crate) name_candidates: HashMap<u64, super::NameCandidate>,
+    /// A selection call moved the `"target"` view inside a chunk; the app's unit feed re-pushes
+    /// `"target"` from the committed selection, whatever its memo holds.
+    pub(crate) target_view_moved: bool,
     /// The player's auras in the reference cache's insertion order (`0xbc6040`), durations joined:
     /// the `GetPlayerBuff` family's list, and any token naming the player's.
     pub(crate) player_auras: Vec<AuraState>,
@@ -363,9 +370,14 @@ pub(crate) struct Model {
     /// The player's active tracking aura, behind `GetTrackingTexture`.
     pub(crate) tracking: Option<super::aura::TrackingState>,
     /// The calls that touch the selection, the cast or the targeting cursor, in call order.
-    pub(crate) script_calls: Vec<super::calls::ScriptCall>,
-    /// The binding functions' queue, gate depth and mouselook state.
+    pub(crate) script_calls: Vec<super::calls::QueuedCall>,
+    /// The binding functions' queue and mouselook state.
     pub(crate) input: super::input_verbs::InputState,
+    /// The selection change a script call made and the input events it ran under, for the event
+    /// the unit feed signals for it ([`super::UiScript::note_selection_cause`]).
+    pub(crate) selection_cause: Option<(Option<u64>, super::InputEvents)>,
+    /// The protected-action gate's input events ([`super::protected`]).
+    pub(crate) protected: super::protected::Flags,
     /// `DropItemOnUnit` tokens (`0x48d960`), gated by the app; a refusal silently keeps the item.
     pub(crate) drop_item_on_unit: Vec<String>,
 
@@ -398,6 +410,8 @@ pub(crate) struct Model {
     pub(crate) social: social::SocialState,
     /// Social calls (`AddFriend`, `RemoveFriend`, `SendWho`, …) queued.
     pub(crate) social_requests: Vec<social::SocialRequest>,
+    /// `LFGDungeons.dbc`, pushed by the app.
+    pub(crate) lfg_dungeons: Vec<super::lfg::LfgDungeon>,
     /// The client-local LFG slot words (`[0xbc70a0]`) and comment (`[0xbc6e98]`, 0x80 bytes) that
     /// `SetLookingForGroup` writes and `GetLookingForGroup` reads; the reference's slots stay 0.
     pub(crate) lfg_slots: [u32; 3],
@@ -514,6 +528,12 @@ pub(crate) struct Model {
     pub(crate) cvar_changes: Vec<(String, String)>,
     /// `(name, default)` per addon `RegisterCVar` that created a slot.
     pub(crate) cvar_registrations: Vec<(String, String)>,
+    /// How many CVars Lua's `RegisterCVar` has created this process (`[0xb4e3c8]`), which nothing
+    /// resets; seeded by the host into each VM and read back from it.
+    pub(crate) cvar_lua_created: u32,
+    /// The lines a CVar's change callback printed ([`super::CvarVerdict::line`]), for the host's
+    /// console.
+    pub(crate) cvar_console: Vec<String>,
     pub(crate) cvars_warned: HashSet<String>,
     /// The lowercased names a Lua `SetCVar` refuses, the reference's flag bit2 (`rec+0x1c & 4`,
     /// `CVar::SetReadOnly 0x63e030`). Kept beside the rows, so a host re-seed never clears it.
@@ -551,7 +571,7 @@ pub(crate) struct Model {
     pub(crate) action_sets: Vec<(u32, u32)>,
     /// GlobalStrings keys of refusals this crate raises, fired by the app as `UI_ERROR_MESSAGE`
     /// (the reference's `DisplayError` `0x496720`), each a literal from `0xb4b498` (stride `0x14`).
-    pub(crate) ui_errors: Vec<&'static str>,
+    pub(crate) ui_errors: Vec<(&'static str, super::InputEvents)>,
 
     pub(crate) spellbook: spellbook::SpellBookState,
     /// The pet's spellbook, a second array as in the reference (`0xb700f0`, `0xb6f098`).
@@ -667,6 +687,10 @@ pub(crate) struct Model {
     pub(crate) containers: HashMap<i64, container::ContainerState>,
     /// Per `(bag, slot)`, `(start, duration, enabled)` in `GetTime` seconds, stamped at push.
     pub(crate) container_cooldowns: HashMap<(i64, u32), (f64, f64, bool)>,
+    /// The same triple for a worn item, by live-API slot id (1..=19); the cooldown query is keyed
+    /// by the item's entry (`0x6e2ed0`), so a worn trinket answers as a bagged one does. Kept off
+    /// the doll snapshot, whose change fires `UNIT_INVENTORY_CHANGED`.
+    pub(crate) worn_cooldowns: HashMap<usize, (f64, f64, bool)>,
     /// `HasKey()`: a keys-family item in equipment, bags, bank or keyring; gates the keyring UI.
     pub(crate) has_key: bool,
     /// What the cursor carries; nothing moves locally, the server's updates settle the bags.
@@ -685,9 +709,9 @@ pub(crate) struct Model {
     /// Targeting wants an item (`0x6e6330`): a bag or paper-doll click becomes a pick.
     pub(crate) item_pick_armed: bool,
     /// Picked `(bag, slot)`s; a paper-doll click is `EQUIPMENT_BAG` and its 1-based inventory slot.
-    pub(crate) item_picks: Vec<(i64, u32)>,
+    pub(crate) item_picks: Vec<cursor::ItemPick>,
     /// `BindEnchant()` and `ReplaceEnchant()`, the enchant popups' answers.
-    pub(crate) enchant_confirms: Vec<cursor::EnchantConfirm>,
+    pub(crate) enchant_confirms: Vec<cursor::EnchantAnswer>,
     /// `DeleteCursorItem`'s `(bag, slot, count)`, 0 for the whole stack, as `CMSG_DESTROYITEM`.
     pub(crate) container_destroys: Vec<(i64, u32, u32)>,
     /// The wrapping paper a right-click armed (`0x5edea0`: lock it, cursor mode 2, no packet). Not
@@ -720,6 +744,15 @@ pub(crate) struct Model {
     /// `SetLayoutMode`'s value, the root's `+0xcf8` (0 at start, `0x7642a5`): while non-zero, a
     /// press with Control or Alt held is a layout drag (`0x766301`).
     pub(crate) layout_mode: i32,
+    /// `SetEuropeanNumbers`'s switch, `[0xcf4d24]` (0 at start): while set, a FontString's or a
+    /// Button's `SetText` swaps the dots and commas of its numbers (`0x771d9f`, `0x771c50`).
+    pub(crate) european_numbers: bool,
+    /// The client's locale index, `[0xc0e080]` (0, enUS, until the host seats the install's): the
+    /// name `GetLocale` answers is the table `0x8558a4` at it ([`crate::toc::LOCALES`]).
+    pub(crate) locale: usize,
+    /// `Wow.ini`'s `Region` as start-up hands it to the name check (`0x402b7f` → `0x6c91b8`,
+    /// `[0x86c9e0]`): 0 until the host seats the install's.
+    pub(crate) client_region: i32,
     /// A Slider thumb drag, left press to release or pointer leave, handled here with no Lua.
     pub(crate) slider_drag: Option<slider::SliderDrag>,
     /// A ColorSelect wheel or value-bar drag, press to release.
@@ -767,6 +800,10 @@ pub(crate) struct Model {
     pub(crate) trainer_filter: [bool; 3],
     /// Collapsed skill-line ids, kept across a re-push and cleared when the trainer closes.
     pub(crate) trainer_collapsed: HashSet<u32>,
+    /// The skill-line filter `ds:0xb73a20`: bit n set shows header group n, every bit on a list.
+    pub(crate) trainer_line_filter: u32,
+    /// `OpenTrainer` asked for the player's own trainer list; the app drains it.
+    pub(crate) trainer_open_own: bool,
 
     /// The open taxi map, the `TakeTaxiNode` calls, whether `CloseTaxiMap` ran and whether we ride.
     pub(crate) taxi: Option<taxi::TaxiUiState>,
@@ -818,7 +855,7 @@ pub(crate) struct Model {
 
     /// `EquipPendingItem`/`CancelPendingEquip` answers in order, and `ConfirmBindOnUse()` calls.
     pub(crate) pending_equip_answers: Vec<bind_confirm::PendingEquipAnswer>,
-    pub(crate) bind_on_use_confirms: u32,
+    pub(crate) bind_on_use_confirms: Vec<bool>,
 
     /// The open loot, the row clicks and whether `CloseLoot` ran. A click is the reference's take
     /// `0x4c2790` with flag 0, raising `LOOT_BIND` for a bind-on-pickup row (a `LootButton`'s own
@@ -827,7 +864,9 @@ pub(crate) struct Model {
     pub(crate) loot_picks: Vec<u32>,
     /// `LootSlot(slot)` rows, 1-based, apart from clicks for the reference's pending-slot gate.
     pub(crate) loot_confirms: Vec<u32>,
-    pub(crate) loot_close: bool,
+    /// The first `CloseLoot` since the last drain, with its `failed` flag; a later one in the
+    /// same frame finds the loot already released.
+    pub(crate) loot_close: Option<bool>,
     /// `GiveMasterLoot(slot, candidateIndex)`, both 1-based display positions the app translates.
     pub(crate) loot_master_gives: Vec<(u32, u32)>,
 
@@ -893,9 +932,17 @@ pub(crate) struct Model {
     /// The sell slot's item, resolved to its guid when `StartAuction` fires.
     pub(crate) auction_sell_item: Option<cursor::CursorItem>,
 
-    /// The open trade and its calls: `InitiateTrade` tokens, the accept, unaccept and cancel flags,
-    /// and `SetTradeMoney` copper (`CMSG_SET_TRADE_GOLD`).
+    /// The last trade's two offers and its calls: `InitiateTrade` tokens, the accept, unaccept and
+    /// cancel flags, and `SetTradeMoney` copper (`CMSG_SET_TRADE_GOLD`). The offers are the
+    /// getters' tables (`0xb714f4` and its siblings, `0xb716d0`), which a close leaves alone and
+    /// the next open clears (`0x4bf549`-`0x4bf5ef`).
     pub(crate) trade: Option<trade::TradeState>,
+    /// The partner cell `[0xb71728]` is set: the window is open. Read by the checks that test the
+    /// cell first (`0x4bfd20`) and by `GetPlayerTradeMoney` (`0x4c0706`).
+    pub(crate) trade_window: bool,
+    /// The entries the item getters found filled and unnamed (`0x4c017f`, `0x4c0582`), for the
+    /// host to ask the item cache for with the callback that signals `TRADE_UPDATE`.
+    pub(crate) trade_record_asks: Vec<u32>,
     pub(crate) trade_initiates: Vec<String>,
     pub(crate) trade_accept: bool,
     pub(crate) trade_unaccept: bool,
@@ -903,17 +950,21 @@ pub(crate) struct Model {
     /// `BeginTrade()` and `CancelTrade()` calls.
     pub(crate) trade_begin: bool,
     pub(crate) trade_cancel: bool,
-    pub(crate) trade_set_money: Option<u32>,
+    pub(crate) trade_set_money: Vec<u32>,
     /// Items dropped on our slots, `(1-based trade slot, bag, slot)`, and the slots clicks cleared.
     pub(crate) trade_set_items: Vec<(u32, i64, u32)>,
     pub(crate) trade_clear_items: Vec<u32>,
     /// The item each of our trade slots holds, as the client's own table records it at the click
     /// (`[0xb716d0]`, written by `0x4bfa70`): the item a later click puts back on the cursor, and
-    /// one the client keeps locked until the trade closes (`0x4bfcf0`).
+    /// one the client keeps locked until the trade closes (`0x4bfcf0` unlocks them and leaves the
+    /// table, which the next open clears).
     pub(crate) trade_offered: [Option<cursor::CursorItem>; super::trade::TRADE_SLOTS],
 
     /// The open questgiver panel, its greeting-row selects and its button calls.
     pub(crate) quest: Option<quest::QuestState>,
+    /// The levels of the last greeting's two pools (`0xbde690`, `0xbdfe60`), which outlive the
+    /// panel until the next list fills them.
+    pub(crate) quest_pool_levels: quest::PoolLevels,
     pub(crate) quest_selects: Vec<quest::QuestSelect>,
     pub(crate) quest_actions: Vec<quest::QuestAction>,
 
@@ -942,6 +993,13 @@ pub(crate) struct Model {
     pub(crate) random_properties: HashMap<u32, super::RandomPropertyView>,
     /// The player's level, class, race and skills, for a tooltip's red requirement lines.
     pub(crate) player_req: PlayerReqState,
+    /// `Lock.dbc` by lock id, pushed whole at startup, and what the active player opens locks with
+    /// (`None` before the first push: no active player). The item tooltip's `LOCKED` colour walks
+    /// them ([`super::lock_check::check_lock`]); `LockType.dbc`'s names by index name its
+    /// `LOCKED_WITH_SPELL_KNOWN` line.
+    pub(crate) lock_rows: HashMap<u32, Vec<super::LockSlotView>>,
+    pub(crate) lock_openers: Option<super::LockOpeners>,
+    pub(crate) lock_type_names: HashMap<u32, String>,
     /// Spell id to its tooltip view, and the misses asked for.
     pub(crate) spell_tooltips: HashMap<u32, super::SpellTooltipView>,
     pub(crate) spell_tooltip_asks: HashSet<u32>,
@@ -1042,6 +1100,15 @@ pub(crate) struct Model {
     pub(crate) skills_selected: Option<u32>,
     /// `AbandonSkill` ids for `CMSG_UNLEARN_SKILL`; nothing changes until the server's update.
     pub(crate) skill_abandons: Vec<u32>,
+    /// The skill points chosen on each line and not yet accepted (row `+0x10`): `AddSkillUp` and
+    /// `RemoveSkillUp` move them, a rebuild or `CancelSkillUps` clears them.
+    pub(crate) skills_pending: HashMap<u32, u32>,
+    /// `SkillTiers.dbc`: tier id to its sixteen step costs.
+    pub(crate) skill_tiers: HashMap<u32, [u32; 16]>,
+    /// Sends the lottery and GM survey verbs queued, for the app to put on the wire.
+    pub(crate) unserved_sends: Vec<super::lottery::UnservedSend>,
+    /// The GM survey's tables and answer buffer.
+    pub(crate) gm_survey: super::gm_survey::SurveyState,
 
     /// The reputation pane's snapshot and the display tree built from it.
     pub(crate) reputation: reputation::ReputationState,
@@ -1137,6 +1204,21 @@ impl Model {
 }
 
 impl Model {
+    /// The charsets the character name check holds a name to: this client's `Region` and locale.
+    pub(crate) fn name_charsets(&self) -> super::NameCharsets {
+        super::NameCharsets::for_client(self.client_region, self.locale)
+    }
+
+    /// The text a `SetText` stores (`0x771d80` with its expand flag): the separator pass
+    /// `0x771c50` while `SetEuropeanNumbers` holds the switch (`0x771d9f`), else the text itself.
+    pub(crate) fn localized_text(&self, text: String) -> String {
+        if self.european_numbers {
+            crate::strings::swap_number_separators(&text)
+        } else {
+            text
+        }
+    }
+
     /// A named font object, matched case-insensitively (ASCII) as the client's `SStrCmpI` does.
     pub(crate) fn font_object(&self, name: &str) -> Option<&FontObject> {
         if name.bytes().any(|b| b.is_ascii_uppercase()) {
@@ -1301,6 +1383,8 @@ impl Model {
             ui_scale_request: None,
             units_by_lower: HashMap::new(),
             units_by_guid: HashMap::new(),
+            name_candidates: HashMap::new(),
+            target_view_moved: false,
             player_auras: Vec::new(),
             unit_auras: HashMap::new(),
             unit_guids: Default::default(),
@@ -1308,6 +1392,8 @@ impl Model {
             tracking: None,
             script_calls: Vec::new(),
             input: Default::default(),
+            protected: Default::default(),
+            selection_cause: None,
             drop_item_on_unit: Vec::new(),
             joined_channels: Vec::new(),
             party: party::PartyState::default(),
@@ -1323,6 +1409,7 @@ impl Model {
             reset_instance_asks: 0,
             social: social::SocialState::default(),
             social_requests: Vec::new(),
+            lfg_dungeons: Vec::new(),
             lfg_slots: [0; 3],
             lfg_comment: String::new(),
             guild: guild::GuildState::default(),
@@ -1376,6 +1463,8 @@ impl Model {
             cvars_saved_base: HashMap::new(),
             cvar_changes: Vec::new(),
             cvar_registrations: Vec::new(),
+            cvar_lua_created: 0,
+            cvar_console: Vec::new(),
             cvars_warned: HashSet::new(),
             cvars_read_only: HashSet::new(),
             multisample_formats: Vec::new(),
@@ -1446,6 +1535,7 @@ impl Model {
             pet_renames: Vec::new(),
             containers: HashMap::new(),
             container_cooldowns: HashMap::new(),
+            worn_cooldowns: HashMap::new(),
             has_key: false,
             cursor: None,
             cursor_grid: false,
@@ -1467,6 +1557,9 @@ impl Model {
             drag: None,
             moving: None,
             layout_mode: 0,
+            european_numbers: false,
+            locale: 0,
+            client_region: 0,
             slider_drag: None,
             color_drag: None,
             gossip: None,
@@ -1493,6 +1586,8 @@ impl Model {
             trainer_close: false,
             trainer_filter: [true; 3],
             trainer_collapsed: HashSet::new(),
+            trainer_line_filter: u32::MAX,
+            trainer_open_own: false,
             taxi: None,
             taxi_takes: Vec::new(),
             taxi_close: false,
@@ -1516,10 +1611,10 @@ impl Model {
             craft_close: false,
             loot: None,
             pending_equip_answers: Vec::new(),
-            bind_on_use_confirms: 0,
+            bind_on_use_confirms: Vec::new(),
             loot_picks: Vec::new(),
             loot_confirms: Vec::new(),
-            loot_close: false,
+            loot_close: None,
             loot_master_gives: Vec::new(),
             loot_rolls: loot_roll::LootRollsState::default(),
             loot_roll_votes: Vec::new(),
@@ -1561,17 +1656,20 @@ impl Model {
             auction_close: false,
             auction_sell_item: None,
             trade: None,
+            trade_window: false,
+            trade_record_asks: Vec::new(),
             trade_initiates: Vec::new(),
             trade_accept: false,
             trade_unaccept: false,
             trade_close: false,
             trade_begin: false,
             trade_cancel: false,
-            trade_set_money: None,
+            trade_set_money: Vec::new(),
             trade_set_items: Vec::new(),
             trade_clear_items: Vec::new(),
             trade_offered: Default::default(),
             quest: None,
+            quest_pool_levels: Default::default(),
             quest_selects: Vec::new(),
             quest_actions: Vec::new(),
             death: death::DeathUiState::default(),
@@ -1588,6 +1686,9 @@ impl Model {
             random_properties: HashMap::new(),
             item_stat_asks: HashSet::new(),
             player_req: PlayerReqState::default(),
+            lock_rows: HashMap::new(),
+            lock_openers: None,
+            lock_type_names: HashMap::new(),
             spell_tooltips: HashMap::new(),
             spell_tooltip_asks: HashSet::new(),
             pet_spell_tooltips: HashMap::new(),
@@ -1670,6 +1771,10 @@ impl Model {
             skills_collapsed: HashSet::new(),
             skills_selected: None,
             skill_abandons: Vec::new(),
+            skills_pending: HashMap::new(),
+            skill_tiers: HashMap::new(),
+            unserved_sends: Vec::new(),
+            gm_survey: Default::default(),
             reputation: reputation::ReputationState::default(),
             reputation_groups: Vec::new(),
             reputation_collapsed: HashSet::new(),
@@ -2398,6 +2503,22 @@ impl Model {
         for h in subtree {
             self.touch_layout_frame(h);
         }
+    }
+
+    /// The `nonspacewrap` flag `rh`'s text lays out under: its own, or on a multi-line EditBox's
+    /// text region always, as the box sets bit `0x1000` of its label (`0x77a58f`).
+    pub(crate) fn non_space_wrap_of(&self, rh: RegionHandle) -> bool {
+        let own = self.region_data.get(&rh).is_some_and(|d| d.non_space_wrap);
+        own || self
+            .arena
+            .region(rh)
+            .and_then(|r| self.arena.frame(r.owner))
+            .is_some_and(|f| {
+                matches!(
+                    &f.kind_state,
+                    crate::widget::KindState::EditBox(eb) if eb.text_region == Some(rh) && eb.multi_line
+                )
+            })
     }
 
     /// Names `rh` on the measure ledger for a write that may move its measure key.

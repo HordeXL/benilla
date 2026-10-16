@@ -1597,9 +1597,12 @@ fn seed_cooldown_filmstrip(
                 cooldown: Some(((now_ms - fraction * span_ms) as i64, span_ms as u32, true)),
                 readable: false,
                 creator: None,
+                gift_creator: None,
                 flags: 0,
                 already_bound: false,
+                occupied_seats: None,
                 enchants: Vec::new(),
+                spell_0: false,
             },
         );
     }
@@ -1655,9 +1658,12 @@ fn seed_bag_window(
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
             flags: 0,
             already_bound: false,
+            occupied_seats: None,
             enchants: Vec::new(),
+            spell_0: false,
         }
     };
     // Five items under their real template ids. Game slot 1, the Small Shield the Tooltip
@@ -1747,9 +1753,12 @@ fn seed_equipped_bags(
             cooldown: None,
             readable: false,
             creator: None,
+            gift_creator: None,
             flags: 0,
             already_bound: false,
+            occupied_seats: None,
             enchants: Vec::new(),
+            spell_0: false,
         };
 
     // The equipped-bag slots (inv ids 20-23, `Bag0Slot`-`Bag3Slot`) get an icon each, so each

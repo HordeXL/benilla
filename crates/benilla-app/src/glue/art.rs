@@ -289,8 +289,9 @@ impl GlueArt {
             "Interface\\Glues\\Common\\Glue-Tooltip-Border",
             images,
         );
+        // Repeat-sampled: a [`super::backdrop::tiled_bg`] spans past one tile.
         self.tooltip_bg =
-            assets.sprite_texture("Interface\\Tooltips\\UI-Tooltip-Background", images);
+            assets.sprite_texture_wrapped("Interface\\Tooltips\\UI-Tooltip-Background", images);
         fn scroll_btn(
             assets: &mut WorldAssets,
             dir: &str,
@@ -340,8 +341,8 @@ impl GlueArt {
             "Interface\\DialogFrame\\UI-DialogBox-Border",
             images,
         );
-        self.dialog_bg =
-            assets.sprite_texture("Interface\\DialogFrame\\UI-DialogBox-Background", images);
+        self.dialog_bg = assets
+            .sprite_texture_wrapped("Interface\\DialogFrame\\UI-DialogBox-Background", images);
         self.dialog_alert =
             assets.sprite_texture("Interface\\DialogFrame\\DialogAlertIcon", images);
         self.chat_input_left = sized(
