@@ -1002,9 +1002,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // (`0x48ec50`) reads the same field.
     g.set(
         "GetBillingTimeRested",
-        lua.create_function(|lua, _: MultiValue| {
-            Ok(f64::from(glue_billing(lua).time_rested))
-        })?,
+        lua.create_function(|lua, _: MultiValue| Ok(f64::from(glue_billing(lua).time_rested)))?,
     )?;
 
     g.set(
