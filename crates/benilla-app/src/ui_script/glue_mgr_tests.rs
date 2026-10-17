@@ -655,6 +655,7 @@ fn an_authentication_behind_the_abandon_generation_is_dropped() {
         realm: realm("Fake"),
         epoch: 1,
         generation,
+        billing: Default::default(),
     };
     app.world_mut().write_message(auth(0));
     app.update();
@@ -2421,11 +2422,13 @@ fn pump(
                 realm,
                 epoch,
                 generation,
+                billing,
             } => {
                 auths.write(WorldAuthMessage {
                     realm,
                     epoch,
                     generation,
+                    billing,
                 });
             }
             E::RosterFailed { epoch } => {

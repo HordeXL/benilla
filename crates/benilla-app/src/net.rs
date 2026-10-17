@@ -2169,6 +2169,8 @@ pub(crate) struct WorldAuthMessage {
     /// The abandon generation of the attempt that dialed it: behind [`LoginAbandon`], the attempt
     /// was cancelled or disconnected since, and the session is not the screen's.
     pub(crate) generation: u64,
+    /// The admitting `SMSG_AUTH_RESPONSE`'s billing group, which the glue billing verbs read.
+    pub(crate) billing: benilla_protocol::messages::Billing,
 }
 
 /// A roster ask on the world session `epoch` failed on the stream.

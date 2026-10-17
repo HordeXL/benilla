@@ -566,6 +566,7 @@ mod tests {
             realm: test_realm(),
             epoch: 1,
             generation: 0,
+            billing: Default::default(),
         });
         app.update();
         app.update();
@@ -620,6 +621,7 @@ mod tests {
                 realm: test_realm(),
                 epoch: 1,
                 generation,
+                billing: Default::default(),
             });
         };
         send(&mut app, 0);

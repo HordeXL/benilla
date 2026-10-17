@@ -99,6 +99,7 @@ mod tests {
             realm: realm("Beta"),
             epoch: 2,
             generation: 0,
+            billing: Default::default(),
         });
         app.update();
     }

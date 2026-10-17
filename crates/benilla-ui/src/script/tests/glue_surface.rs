@@ -139,12 +139,9 @@ const NOT_YET: &[(&str, &[&str])] = &[
     ),
     (
         "the glue core (0x46ddf0, table 0x8373b8): the movie's setter, the \
-         patch and survey and the billing; each a binding of its own, the ones \
-         with an in-game namesake included",
+         patch and the survey; each a binding of its own, the ones with an \
+         in-game namesake included",
         &[
-            "GetBillingPlan",
-            "GetBillingTimeRemaining",
-            "GetBillingTimeRested",
             "PINEntered",
             "PatchDownloadApply",
             "PatchDownloadCancel",

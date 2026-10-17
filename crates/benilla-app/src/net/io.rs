@@ -706,6 +706,7 @@ fn world(
                 realm: realm.clone(),
                 epoch,
                 generation,
+                billing: session.billing(),
             })
             .is_err()
         {

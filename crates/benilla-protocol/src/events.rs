@@ -147,6 +147,11 @@ pub enum SessionEvent {
         realm: crate::RealmInfo,
         epoch: u64,
         generation: u64,
+        /// The connection's billing group, from the admitting `SMSG_AUTH_RESPONSE` (`0x5b41fe`-
+        /// `0x5b4223`). The glue billing verbs read it off the world session, which is live by the
+        /// time this is emitted — the character-select screen is up before [`Self::Connected`], so
+        /// hanging it there alone would leave `GetBillingPlan` answering the zeros at that screen.
+        billing: crate::messages::Billing,
     },
     /// `SMSG_ADDON_INFO` was read (the handler `0x5b4260`, which rebuilds the AddOn index with
     /// `0x51da70` and then calls the listener slot `0x80a400`, `0x5ab2f0`, whose one effect is

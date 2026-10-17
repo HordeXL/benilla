@@ -1,6 +1,7 @@
 //! The glue core's login-screen verbs (registrar `0x46ddf0`, table `0x8373b8`): the login, the
 //! status dialog's button, the saved account, the four user agreements, the build, the locale,
-//! the server, the screen name, the glue music, the movie frame's settings and the quit. Each reads
+//! the server, the screen name, the billing group, the glue music, the movie frame's settings and
+//! the quit. Each reads
 //! a slot of its own, runs one of the glue manager's functions in place through the host the VM is
 //! seated with ([`GlueHost`], a [`GlueCall`]), or leaves the host an effect for its next frame (a
 //! [`GlueRequest`]). The screen state machine (`CGlueMgr`, its frame `CGlueMgr::Update` `0x46b930`)
@@ -224,6 +225,18 @@ pub enum GlueSignal {
     Resume(u32),
 }
 
+/// The world session's billing group, the three fields the admitting `SMSG_AUTH_RESPONSE` wrote
+/// into it (`0x5b41fe`-`0x5b4223`: a dword, a byte, a dword) and the three billing verbs read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GlueBilling {
+    /// `+0x1af4`, `GetBillingTimeRemaining`'s.
+    pub time_remaining: u32,
+    /// `+0x1afc`, the byte `GetBillingPlan` works its three answers out of.
+    pub plan_flags: u8,
+    /// `+0x1af8`, `GetBillingTimeRested`'s.
+    pub time_rested: u32,
+}
+
 /// The glue manager a glue VM is seated with: the host side of `CGlueMgr` and the parts of
 /// `ClientServices` it reads, which outlive the VM as the reference's C globals outlive its Lua
 /// state.
@@ -239,6 +252,12 @@ pub trait GlueHost {
     /// The realm type of the realm selected this process (`0x5ab9a0`: `[0xc28134]`, the record at
     /// `0xc27fb8`), which `GetServerName` looks up.
     fn selected_realm_type(&self) -> Option<u32>;
+    /// The world session's billing group, which the three billing verbs read. The zeros with no
+    /// session seated, where the reference's `ClientServices::GetCurrent` (`0x5ab490`) always has
+    /// one to read.
+    fn billing(&self) -> GlueBilling {
+        GlueBilling::default()
+    }
 }
 
 /// The `ClientServices` status keys (`0x85cae8`, 83 entries), the `ResponseCodes` the world
@@ -713,6 +732,16 @@ fn fire_signal(lua: &Lua, signal: GlueSignal) {
     }
 }
 
+/// The host's billing group, the zeros with none seated.
+fn glue_billing(lua: &Lua) -> GlueBilling {
+    lua.app_data_ref::<Model>()
+        .expect("model app_data")
+        .glue
+        .host
+        .clone()
+        .map_or_else(GlueBilling::default, |host| host.billing())
+}
+
 /// The text of a string global, as [`super::UiScript::global_text`] reads it.
 pub(super) fn global_text(lua: &Lua, key: &str) -> String {
     match lua.globals().get::<Value>(key) {
@@ -929,6 +958,55 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             Ok(flag(host.is_some_and(|h| h.connected())))
         })?,
     )?;
+
+    // The billing group, the three fields the admitting `SMSG_AUTH_RESPONSE` wrote into the world
+    // session (`0x5b41fe`-`0x5b4223`); each verb reads it off the host.
+
+    // `GetBillingTimeRemaining` (`0x46dbf0`): the session's `+0x1af4`, unsigned, and 0 when bit 1
+    // of the plan byte (`+0x1afc`) is set (`0x46dc0a`); the reference's `fild qword` keeps a value
+    // from 2^31 up positive.
+    g.set(
+        "GetBillingTimeRemaining",
+        lua.create_function(|lua, _: MultiValue| {
+            let billing = glue_billing(lua);
+            let minutes = if billing.plan_flags & 0x2 != 0 {
+                0
+            } else {
+                billing.time_remaining
+            };
+            Ok(f64::from(minutes))
+        })?,
+    )?;
+    // `GetBillingPlan` (`0x46dc40`): three numbers off the plan byte `f` (`+0x1afc`) — the plan
+    // code, 1, 2, 3 or 4 for `f & 0x16` equal to 2, 4, 0 or 0x10 and 0 for every other mask
+    // (`0x46dc5e`), then `(f >> 5) & 1` (`0x46dca8`), then `(f >> 3) & 1` (`0x46dcc5`).
+    g.set(
+        "GetBillingPlan",
+        lua.create_function(|lua, _: MultiValue| {
+            let f = glue_billing(lua).plan_flags;
+            let plan = match f & 0x16 {
+                0x2 => 1,
+                0x4 => 2,
+                0 => 3,
+                0x10 => 4,
+                _ => 0,
+            };
+            Ok(MultiValue::from_vec(vec![
+                Value::Number(f64::from(plan)),
+                Value::Number(f64::from((f >> 5) & 1)),
+                Value::Number(f64::from((f >> 3) & 1)),
+            ]))
+        })?,
+    )?;
+    // `GetBillingTimeRested` (`0x46dcf0`): the session's `+0x1af8`, unsigned; the in-game binding
+    // (`0x48ec50`) reads the same field.
+    g.set(
+        "GetBillingTimeRested",
+        lua.create_function(|lua, _: MultiValue| {
+            Ok(f64::from(glue_billing(lua).time_rested))
+        })?,
+    )?;
+
     g.set(
         "DisconnectFromServer",
         lua.create_function(|lua, _: MultiValue| {
@@ -1040,6 +1118,7 @@ mod tests {
         replies: std::cell::RefCell<Vec<(&'static str, Vec<GlueSignal>)>>,
         connected: std::cell::Cell<bool>,
         selected: std::cell::Cell<Option<u32>>,
+        billing: std::cell::Cell<GlueBilling>,
     }
 
     impl GlueHost for FakeHost {
@@ -1065,6 +1144,10 @@ mod tests {
 
         fn selected_realm_type(&self) -> Option<u32> {
             self.selected.get()
+        }
+
+        fn billing(&self) -> GlueBilling {
+            self.billing.get()
         }
     }
 
@@ -1162,6 +1245,71 @@ mod tests {
                 .unwrap(),
             Some(1)
         );
+    }
+
+    /// The billing verbs read the host's group as the reference reads the world session's fields:
+    /// the plan code off `f & 0x16` and the two flag bits (`0x46dc40`), the time remaining with
+    /// bit 1 of `f` zeroing it (`0x46dbf0`), the time rested (`0x46dcf0`). The zeros with no host
+    /// seated, and each verb its own count of numbers.
+    #[test]
+    fn the_billing_verbs_read_the_hosts_group() {
+        let bare = UiScript::new_glue().unwrap();
+        // No host: the flags are 0, and mask 0 is the reference's plan code 3, not 0.
+        assert_eq!(
+            bare.eval::<Vec<f64>>("return { GetBillingPlan() }")
+                .unwrap(),
+            [3.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            bare.eval::<(f64, f64)>("return GetBillingTimeRemaining(), GetBillingTimeRested()")
+                .unwrap(),
+            (0.0, 0.0)
+        );
+
+        let (s, host) = seated(Vec::new());
+        // `f & 0x16` of 2, 4, 0 and 0x10 are 1, 2, 3 and 4; every other mask, 0.
+        for (flags, plan) in [
+            (0x00u8, 3.0),
+            (0x02, 1.0),
+            (0x04, 2.0),
+            (0x10, 4.0),
+            (0x06, 0.0),
+            (0x16, 0.0),
+            (0x08, 3.0),
+            (0x20, 3.0),
+        ] {
+            host.billing.set(GlueBilling {
+                time_remaining: 90,
+                plan_flags: flags,
+                time_rested: 120,
+            });
+            assert_eq!(
+                s.eval::<Vec<f64>>("return { GetBillingPlan() }").unwrap(),
+                [
+                    plan,
+                    f64::from((flags >> 5) & 1),
+                    f64::from((flags >> 3) & 1)
+                ],
+                "flags {flags:#04x}"
+            );
+            assert_eq!(
+                s.eval::<f64>("return GetBillingTimeRested()").unwrap(),
+                120.0
+            );
+            let remaining = if flags & 0x2 != 0 { 0.0 } else { 90.0 };
+            assert_eq!(
+                s.eval::<f64>("return GetBillingTimeRemaining()").unwrap(),
+                remaining,
+                "flags {flags:#04x}"
+            );
+        }
+        assert!(s
+            .eval::<bool>(
+                "return table.getn({GetBillingPlan()}) == 3 \
+                   and table.getn({GetBillingTimeRemaining()}) == 1 \
+                   and table.getn({GetBillingTimeRested()}) == 1"
+            )
+            .unwrap());
     }
 
     /// Every manager verb reaches the host in its call.

@@ -114,11 +114,13 @@ fn on_login_edge(In(ev): In<SessionEvent>, mut e: Edges) {
             realm,
             epoch,
             generation,
+            billing,
         } => {
             e.world_auth.write(WorldAuthMessage {
                 realm,
                 epoch,
                 generation,
+                billing,
             });
         }
         SessionEvent::RosterFailed { epoch } => {

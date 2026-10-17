@@ -159,9 +159,9 @@ use std::rc::Rc;
 
 use benilla_protocol::{Character, LoginRefusal, LoginStage, RealmInfo, RosterCause};
 use benilla_ui::script::{
-    GlueCall, GlueCharacter, GlueHost, GlueNotice, GlueRealm, GlueRealmCells, GlueRequest,
-    GlueSelectCells, GlueSignal, GlueText as Text, NoticeState, ScriptValue, UiScript, VmKind,
-    GLUE_STATUS_KEYS,
+    GlueBilling, GlueCall, GlueCharacter, GlueHost, GlueNotice, GlueRealm, GlueRealmCells,
+    GlueRequest, GlueSelectCells, GlueSignal, GlueText as Text, NoticeState, ScriptValue, UiScript,
+    VmKind, GLUE_STATUS_KEYS,
 };
 
 use crate::glue_session::login::{GlueLogin, LoginGuardRefused};
@@ -562,6 +562,9 @@ pub(crate) struct GlueMgr {
     auth_final: bool,
     /// The world connection is up (`[svc+0x1b00]`).
     connected: bool,
+    /// The world session's billing group, which the billing verbs read (`+0x1af4`, `+0x1afc`,
+    /// `+0x1af8`): the admitting `SMSG_AUTH_RESPONSE`'s, kept for the link.
+    billing: GlueBilling,
     /// `ChangeRealm` dropped a live world link to connect to another realm (`[0xb41d9c]`, set at
     /// `0x46b235`): the connect waits for the drop's handler (`0x46c56f`-`0x46c5bf`).
     reconnect: bool,
@@ -1703,6 +1706,10 @@ impl GlueHost for GlueMgrCell {
     fn selected_realm_type(&self) -> Option<u32> {
         self.0.borrow().selected.as_ref().map(|r| r.realm_type)
     }
+
+    fn billing(&self) -> GlueBilling {
+        self.0.borrow().billing
+    }
 }
 
 /// `SelectRealmByName` (`0x5ab6f0`): the first realm in the holder whose name matches, case
@@ -1989,6 +1996,12 @@ pub(crate) fn drive_glue_mgr(
         let generation = crate::net::LoginAbandon::now(asks.abandon.as_deref());
         for msg in news.world_auths.read() {
             if msg.generation == generation {
+                // The session's billing group, which the authentication's own handler wrote.
+                mgr.billing = GlueBilling {
+                    time_remaining: msg.billing.time_remaining,
+                    plan_flags: msg.billing.plan_flags,
+                    time_rested: msg.billing.time_rested,
+                };
                 mgr.on_world_authenticated(msg.realm.clone(), msg.epoch);
             }
         }
