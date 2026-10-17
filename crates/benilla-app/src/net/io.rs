@@ -31,7 +31,7 @@ use anyhow::{anyhow, Result};
 use benilla_assets::LockRecover;
 use benilla_protocol::{
     messages::SurveyAnswer, AuthReject, CharAction, LoginStage, Poll, RosterCause, SessionEnd,
-    SessionEvent, WardenRequired, WorldReader, WorldSession, WorldWriter,
+    SessionEvent, WorldReader, WorldSession, WorldWriter,
 };
 use crossbeam_channel::{Receiver, Sender};
 
@@ -161,6 +161,9 @@ impl PingClock {
 /// Cap on send warnings per connection, so a movement stream during an outage cannot flood the log.
 const SEND_WARN_CAP: u32 = 8;
 
+/// How often the character park looks at the world socket for a server that dropped it.
+const PARK_LINK_CHECK: Duration = Duration::from_millis(500);
+
 /// What one wake-up at the character park asked for, so every jump out is made outside `select!`.
 enum Parked {
     /// `CMSG_PLAYER_LOGIN` with this guid.
@@ -171,9 +174,7 @@ enum Parked {
     Renamed(u8, Option<(u64, String)>),
     /// `CMSG_CHAR_ENUM` was serviced in place; the roster is re-emitted, with no result.
     Listed,
-    /// The server refused the roster to a client without Warden: the login fails for good.
-    Refused(String),
-    /// Stay parked: a realm-list refresh, or a Cancel over this screen.
+    /// Stay parked: a realm-list refresh, a Cancel over this screen, or a tick that found the link up.
     StayPut,
     /// Drop the parked world session and dial this realm under the abandon generation its ask
     /// carried.
@@ -529,7 +530,6 @@ fn run(
                 let _ = events_tx.send(SessionEvent::LoginFailed {
                     refusal: if dial.is_some() { None } else { refusal },
                     reason: format!("{e:#}"),
-                    terminal: false,
                     dial,
                 });
                 return Ok(Cycle::Repark);
@@ -613,17 +613,6 @@ fn world(
         let _ = events_tx.send(SessionEvent::LoginFailed {
             refusal,
             reason,
-            terminal: false,
-            dial: None,
-        });
-        Ok(WorldEnd::Failed)
-    };
-    // A failure resubmitting cannot fix: the app shows it and does not retry.
-    let fail_terminal = |reason: String| {
-        let _ = events_tx.send(SessionEvent::LoginFailed {
-            refusal: None,
-            reason,
-            terminal: true,
             dial: None,
         });
         Ok(WorldEnd::Failed)
@@ -677,10 +666,6 @@ fn world(
                 if canceled() {
                     return Ok(WorldEnd::Failed);
                 }
-                // A Warden refusal is the server's answer, not a transport fault.
-                if let Some(w) = e.downcast_ref::<WardenRequired>() {
-                    return fail_terminal(w.to_string());
-                }
                 // The world server's refusal code, for the screen's `AUTH_*` string.
                 if let Some(r) = e.downcast_ref::<benilla_protocol::WorldAuthReject>() {
                     return fail(
@@ -708,6 +693,8 @@ fn world(
         // its wants.
         while park_rx.try_recv().is_ok() {}
         let epoch = WORLD_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        // Whether this link's unanswered Warden request has been logged.
+        let mut warden_noted = false;
         // A server that sends the addon reply in front of the authentication answer (vmangos
         // builds it in the auth handler, `WorldSocket.cpp:447`) has had it read by now.
         let mut addon_news = AddonNews::default();
@@ -731,9 +718,10 @@ fn world(
         let mut fresh_link = true;
         loop {
             // Park at character select until the app answers. Create and delete are serviced in place.
-            // If the server kicked the parked socket meanwhile, the login below fails, the cycle
-            // restarts and the app re-sends its pick, so the park needs no keepalive.
+            // The reference keeps servicing the connection here, and a drop is the disconnect
+            // handler (`0x46c540`) at once, so the park looks at the socket every tick.
             bevy::log::info!("net: parked at character select");
+            let link_check = crossbeam_channel::tick(PARK_LINK_CHECK);
             let guid = loop {
                 // The realm list's requests and the character screen's share one channel, in the
                 // order they were made: `RealmList.xml` is a `frameStrata="DIALOG"` frame, so Change
@@ -781,25 +769,29 @@ fn world(
                         }
                         // `GetCharacterListUpdate` (`0x4723d0` → `0x46b880` → `0x5aabb0` → `0x5b4690`):
                         // the reference asks the world server again whenever the glue screen wants
-                        // the list. A Warden refusal is the server's answer, as at the park entry.
+                        // the list.
                         Ok(ParkRequest::Char(CharRequest::Enumerate)) => match session.char_enum() {
                             Ok(c) => {
                                 characters = c;
                                 Parked::Listed
                             }
-                            Err(e) => match e.downcast_ref::<WardenRequired>() {
-                                Some(w) => Parked::Refused(w.to_string()),
-                                // The stream failed under the ask: the screen's query fails
-                                // (`0x5ab300`), and the session ends as a dropped socket does.
-                                None => {
-                                    let _ = events_tx.send(SessionEvent::RosterFailed { epoch });
-                                    return Err(e);
-                                }
-                            },
+                            // The stream failed under the ask: the screen's query fails
+                            // (`0x5ab300`), and the session ends as a dropped socket does.
+                            Err(e) => {
+                                let _ = events_tx.send(SessionEvent::RosterFailed { epoch });
+                                return Err(e);
+                            }
                         },
                     },
                     recv(login_rx) -> msg => msg.map_or(Parked::Exit, Parked::Login),
+                    recv(link_check) -> _ => match session.poll_link() {
+                        Ok(()) => Parked::StayPut,
+                        // The server dropped the link (a kick among them): the session ends as a
+                        // stream failure does, `DISCONNECTED_FROM_SERVER` and the login screen.
+                        Err(e) => return Err(e),
+                    },
                 };
+                note_warden(&session, &mut warden_noted);
                 let (action, code) = match answer {
                     Parked::Exit => return Ok(WorldEnd::Cycle(Cycle::Exit)),
                     Parked::Repark => return Ok(WorldEnd::Cycle(Cycle::Repark)),
@@ -811,7 +803,6 @@ fn world(
                         continue 'realm;
                     }
                     Parked::Leave => return Ok(WorldEnd::Failed),
-                    Parked::Refused(reason) => return fail_terminal(reason),
                     Parked::Acted(action, code) => (action, code),
                     // The reference renames its record in place (`0x4725f0`) and asks for no
                     // roster; the park's own copy, which names the character at the world entry,
@@ -872,7 +863,7 @@ fn world(
             // reference's does (`super::enter_world_on_self_create`); a server may drop it before then.
             session.player_login(refuse_once(guid))?;
 
-            let billing_time_rested = session.billing_time_rested();
+            let billing = session.billing();
             let tutorial_flags = session.take_tutorial_flags();
             // `SMSG_ADDON_INFO` carries no names, so it is paired back against the block we sent. No
             // reply means no AddOn index space at all, carried as `None`. The link's one reply
@@ -902,7 +893,7 @@ fn world(
                 .send(SessionEvent::Connected {
                     self_guid: guid,
                     name,
-                    billing_time_rested,
+                    billing,
                     tutorial_flags,
                     addon_info,
                 })
@@ -1054,6 +1045,17 @@ fn stream(
                 }
             }
         }
+    }
+}
+
+/// Logs, once per link, that the server asked for Warden before the world entry and was left
+/// unanswered ([`WorldSession::warden_asked`]).
+fn note_warden(session: &WorldSession, noted: &mut bool) {
+    if !*noted && session.warden_asked() {
+        *noted = true;
+        bevy::log::debug!(
+            "net: SMSG_WARDEN_DATA read past unanswered: benilla runs no Warden module"
+        );
     }
 }
 

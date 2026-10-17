@@ -33,7 +33,7 @@ use cosmic_text::{
 
 use benilla_assets::{LockRecover, WorldAssets};
 
-use faces::{hhea_ascent_ratio, register_font, CLIENT_FONTS};
+use faces::{charmap_glyph, hhea_ascent_ratio, register_font, unicode_charmap, CLIENT_FONTS};
 pub(crate) use gpu::{FontAtlasInit, UiTextPlugin};
 
 use super::outline::outlined_cell;
@@ -61,6 +61,8 @@ struct Face {
     /// The face's own tables, for FreeType's metrics ([`sfnt::Sfnt::glyph`]); `None` for a font
     /// with no TrueType outlines, which falls back to the shaper's.
     sfnt: Option<Arc<sfnt::Sfnt>>,
+    /// The cmap encoding record characters map through ([`faces::unicode_charmap`]).
+    charmap: u16,
 }
 
 /// `(face, glyph, ppem, outline radius)`: one bitmap per exact device-pixel size.
@@ -184,8 +186,9 @@ pub(crate) struct TextEngine {
 /// A `cosmic-text` font system over an empty database: the client's faces are the only faces.
 /// `FontSystem::new()` loads the system fonts, and `get_font_matches` shapes with the first face in
 /// the database that can draw a character, so a system face would silently stand in for a client
-/// face. A character no client or addon face carries draws nothing, as in the reference, and
-/// measures 0. The locale only picks which language's family name a face answers to.
+/// face. A character its own face's charmap lacks draws and measures nothing, as in the reference
+/// ([`TextEngine::ensure_char`]). The locale only picks which language's family name a face
+/// answers to.
 fn client_font_system() -> FontSystem {
     FontSystem::new_with_locale_and_db("en-US".to_string(), fontdb::Database::new())
 }
@@ -199,6 +202,11 @@ fn register_face(
     path: &str,
     bytes: Vec<u8>,
 ) {
+    // A face with no Unicode charmap does not open, as in `load`: nothing could be drawn from it.
+    let Some(charmap) = unicode_charmap(&bytes) else {
+        warn!("ui_text: {path} has no Unicode charmap, so it does not open");
+        return;
+    };
     let ascent_ratio = hhea_ascent_ratio(&bytes).unwrap_or(0.794);
     let sfnt = sfnt::Sfnt::parse(bytes.clone()).map(Arc::new);
     match register_font(font_system, bytes) {
@@ -213,6 +221,7 @@ fn register_face(
                 stretch: r.stretch,
                 ascent_ratio,
                 sfnt,
+                charmap,
             });
         }
         Err(e) => warn!("ui_text: failed to register {path}: {e:#}"),
@@ -268,6 +277,10 @@ impl TextEngine {
                 warn!("ui_text: failed to read {path} from the loose files or the patch chain");
                 continue;
             };
+            let Some(charmap) = unicode_charmap(&bytes) else {
+                warn!("ui_text: {path} has no Unicode charmap, so it does not open");
+                continue;
+            };
             let ascent_ratio = hhea_ascent_ratio(&bytes).unwrap_or(0.794);
             let sfnt = sfnt::Sfnt::parse(bytes.clone()).map(Arc::new);
             match register_font(&mut font_system, bytes) {
@@ -282,6 +295,7 @@ impl TextEngine {
                         stretch: r.stretch,
                         ascent_ratio,
                         sfnt,
+                        charmap,
                     });
                 }
                 Err(e) => warn!("ui_text: failed to register {path}: {e:#}"),
@@ -369,7 +383,7 @@ impl TextEngine {
             Some(i) => i,
             None => {
                 warn!(
-                    "ui_text: font miss: '{p}' does not resolve in the loose files or the patch \
+                    "ui_text: font miss: '{p}' does not load from the loose files or the patch \
                      chain — falling back to {}",
                     CLIENT_FONTS[0]
                 );
@@ -382,6 +396,10 @@ impl TextEngine {
     fn load_face(&mut self, path: &str, key: &str) -> Option<usize> {
         let source = self.source.as_ref()?;
         let bytes = read_font_bytes(source, path)?;
+        let Some(charmap) = unicode_charmap(&bytes) else {
+            warn!("ui_text: {path} has no Unicode charmap, so it does not open");
+            return None;
+        };
         let ascent_ratio = hhea_ascent_ratio(&bytes).unwrap_or(0.794);
         let sfnt = sfnt::Sfnt::parse(bytes.clone()).map(Arc::new);
         let r = register_font(&mut self.font_system, bytes)
@@ -397,6 +415,7 @@ impl TextEngine {
             stretch: r.stretch,
             ascent_ratio,
             sfnt,
+            charmap,
         });
         self.path_to_face.insert(key.to_string(), index);
         info!("ui_text: loaded font face {path}");
@@ -595,6 +614,30 @@ impl TextEngine {
         let f = self.faces.get(face)?;
         let (font_id, family, weight, style, stretch) =
             (f.id, f.family.clone(), f.weight, f.style, f.stretch);
+        // The face's own charmap answers first, as `FT_Get_Char_Index` (`0x7ce960`) does ahead of
+        // the load (`0x5d1154`): a code point it lacks fails the glyph (`0x5d1162`), so the lookup
+        // `0x5cabd0` returns none and the line builder skips the character with no quad and no
+        // step (`0x5cced6`). The shaper would draw the face's `.notdef` box in its place.
+        let charmap = f.charmap;
+        let mapped = self
+            .font_system
+            .db()
+            .with_face_data(font_id, |data, index| {
+                charmap_glyph(data, index, charmap, ch)
+            })
+            .flatten();
+        if mapped.is_none() {
+            // The face's own charmap says no: an empty shape, so the character draws and measures
+            // nothing, as the reference's failed `FT_Get_Char_Index` does, and the caller decides
+            // between the CJK fallback and caching the miss. The shaper would draw `.notdef` here.
+            return Some(Shaped {
+                glyphs: Vec::new(),
+                font_id,
+                family,
+                weight,
+                style,
+            });
+        }
         let attrs = Attrs::new()
             .family(Family::Name(&family))
             .weight(weight)
@@ -1066,6 +1109,47 @@ mod line_law_tests {
                 );
             }
         }
+    }
+
+    /// A code point its face's charmap lacks draws nothing and takes no room (`0x7ce960` → glyph
+    /// 0 → `0x5cced6`), where the shaper would draw `.notdef`. Friz, the bubbles' and plates' face,
+    /// has no Cyrillic, so `1Ж2` is `12`, kerned pair and all; Arial Narrow, the chat frame's,
+    /// carries `Ж` and draws it.
+    #[test]
+    fn a_code_point_the_face_lacks_draws_nothing_and_takes_no_room() {
+        benilla_formats::wow_data_or_skip!();
+        let mut e = test_engine(1.0).expect("the client faces open");
+        let (friz, arial) = (
+            e.face_for(Some(FRIZ)),
+            e.face_for(Some("Fonts\\ARIALN.TTF")),
+        );
+        for ch in ['Ж', 'я', '中'] {
+            e.ensure_str(friz, 12, 0, &ch.to_string());
+            let cell = e.char_cell(friz, 12, ch).expect("the miss is cached");
+            assert!(
+                cell.glyphs.is_empty(),
+                "Friz has no {ch:?}: no glyph, no step"
+            );
+        }
+        e.ensure_str(arial, 12, 0, "Ж");
+        let g = e.char_cell(arial, 12, 'Ж').expect("shaped").glyphs[0];
+        assert!(
+            g.glyph_id != 0 && g.px > 0.0,
+            "ARIALN maps Ж to a real glyph"
+        );
+        assert!(e.cell(arial, 12, 0, g.glyph_id).is_some(), "…and draws it");
+        let spec = |path| FontSpec {
+            path: Some(path),
+            height: Some(12.0),
+            outline: Outline::None,
+            spacing: 0.0,
+            shadow_x: 0.0,
+            alpha_gradient: None,
+            non_space_wrap: false,
+            max_lines: 0,
+        };
+        assert_eq!(string_width(&mut e, "1Ж2", spec(FRIZ), 0.0), 16.0);
+        assert_eq!(string_width(&mut e, "Ж", spec(FRIZ), 0.0), 0.0);
     }
 
     /// A composite glyph's ink as the reference's FreeType builds it (`0x7d40e6`–`0x7d4246`): its
