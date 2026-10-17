@@ -471,7 +471,7 @@
         }
         -- Reset To Default confirms, as the era's does; our string, since 1.12 has none.
         StaticPopupDialogs["BENILLA_CONFIRM_RESET_KEYBINDINGS"] = {
-            text = "Are you sure you want to reset all keybindings to their defaults?",
+            text = "确定要将所有按键设置恢复为默认值吗？",
             button1 = BenillaKeyBindings_String("OKAY", "Okay"),
             button2 = BenillaKeyBindings_String("CANCEL", "Cancel"),
             OnAccept = function()

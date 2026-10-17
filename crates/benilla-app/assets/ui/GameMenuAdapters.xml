@@ -39,7 +39,7 @@
         -- space: a width or height of 0 is no size in 1.12's layout, not a flat rect.
 
         -- Literal: 1.12 has no GAMEMENU_OPTIONS; its OPTIONS_MENU is "Options Menu".
-        GameMenuButtonOptions:SetText("Options")
+        GameMenuButtonOptions:SetText("选项")
         GameMenuButtonOptions:ClearAllPoints()
         GameMenuButtonOptions:SetPoint("TOP", GameMenuFrame, "TOP", 0, -32)
         GameMenuButtonOptions:SetScript("OnClick", function()
@@ -66,12 +66,12 @@
         local editMode = CreateFrame("Button", "BenillaGameMenuButtonEditMode", GameMenuFrame,
             "GameMenuButtonTemplate")
         editMode:SetPoint("TOP", GameMenuButtonKeybindings, "TOP", 0, -19)
-        editMode:SetText("Edit Mode")
+        editMode:SetText("编辑模式")
         editMode:Disable()
         local support = CreateFrame("Button", "BenillaGameMenuButtonSupport", GameMenuFrame,
             "GameMenuButtonTemplate")
         support:SetPoint("TOP", editMode, "BOTTOM", 0, 0)
-        support:SetText("Support")
+        support:SetText("支持")
         support:Disable()
 
         GameMenuButtonMacros:SetPoint("TOP", support, "BOTTOM", 0, 0)

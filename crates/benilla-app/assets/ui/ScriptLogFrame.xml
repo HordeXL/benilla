@@ -78,13 +78,13 @@
 
             local summary
             if total == 0 then
-                summary = "No problems this session."
+                summary = "本次会话没有发现问题。"
             elseif total > shown then
-                summary = format("%d problems (%d older not kept)", total, total - shown)
+                summary = format("%d 个问题（另有 %d 条较早的记录未保留）", total, total - shown)
             elseif total == 1 then
-                summary = "1 problem"
+                summary = "1 个问题"
             else
-                summary = format("%d problems", total)
+                summary = format("%d 个问题", total)
             end
             getglobal("BenillaScriptLogSummary"):SetText(summary)
 
@@ -142,7 +142,7 @@
                 end
             end
             if text == "" then
-                text = "Select a row above to read it in full."
+                text = "请选择上方的一行以查看完整内容。"
             end
             local box = getglobal("BenillaScriptLogDetailText")
             if text ~= box.shown then
@@ -203,7 +203,7 @@
             if getglobal("BenillaScriptLogFrame"):IsVisible() then
                 BenillaScriptLog_Update()
             end
-            DEFAULT_CHAT_FRAME:AddMessage("Script log cleared.", 1.0, 1.0, 0.0)
+            DEFAULT_CHAT_FRAME:AddMessage("脚本日志已清空。", 1.0, 1.0, 0.0)
         end
     ]]></Script>
 
@@ -250,7 +250,7 @@
                 <Texture file="Interface\ClassTrainerFrame\UI-ClassTrainer-TopRight"><Size><AbsDimension x="128" y="256"/></Size><Anchors><Anchor point="TOPRIGHT"/></Anchors></Texture>
                 <Texture file="Interface\ClassTrainerFrame\UI-ClassTrainer-BotLeft"><Size><AbsDimension x="256" y="256"/></Size><Anchors><Anchor point="BOTTOMLEFT"/></Anchors></Texture>
                 <Texture file="Interface\ClassTrainerFrame\UI-ClassTrainer-BotRight"><Size><AbsDimension x="128" y="256"/></Size><Anchors><Anchor point="BOTTOMRIGHT"/></Anchors></Texture>
-                <FontString name="BenillaScriptLogTitle" inherits="GameFontNormal" justifyH="CENTER" text="Script Errors">
+                <FontString name="BenillaScriptLogTitle" inherits="GameFontNormal" justifyH="CENTER" text="脚本错误">
                     <Anchors><Anchor point="TOP" relativePoint="TOP"><Offset><AbsDimension x="0" y="-17"/></Offset></Anchor></Anchors>
                 </FontString>
                 <FontString name="BenillaScriptLogSummary" inherits="GameFontHighlightSmall" justifyH="LEFT" text="">
@@ -357,12 +357,12 @@
 
             <!-- The art's two button sockets, where the class trainer's Train and Exit sit
                  (Blizzard_TrainerUI.xml:481-513). -->
-            <Button name="BenillaScriptLogClearButton" inherits="UIPanelButtonTemplate" text="Clear">
+            <Button name="BenillaScriptLogClearButton" inherits="UIPanelButtonTemplate" text="清除">
                 <Size><AbsDimension x="80" y="22"/></Size>
                 <Anchors><Anchor point="CENTER" relativePoint="TOPLEFT"><Offset><AbsDimension x="224" y="-420"/></Offset></Anchor></Anchors>
                 <Scripts><OnClick>BenillaScriptLog_Clear()</OnClick></Scripts>
             </Button>
-            <Button name="BenillaScriptLogCloseBottomButton" inherits="UIPanelButtonTemplate" text="Close">
+            <Button name="BenillaScriptLogCloseBottomButton" inherits="UIPanelButtonTemplate" text="关闭">
                 <Size><AbsDimension x="80" y="22"/></Size>
                 <Anchors><Anchor point="CENTER" relativePoint="TOPLEFT"><Offset><AbsDimension x="305" y="-420"/></Offset></Anchor></Anchors>
                 <Scripts><OnClick>HideUIPanel(getglobal("BenillaScriptLogFrame"))</OnClick></Scripts>

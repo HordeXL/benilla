@@ -7,7 +7,7 @@
     <Script>
         GlueDialogTypes["BENILLA_REALMLIST"] = {
             -- The realmList CVar's registered help text.
-            text = "Address of realm list server",
+            text = "服务器列表地址",
             button1 = TEXT(OKAY),
             button2 = TEXT(CANCEL),
             hasEditBox = 1,
@@ -82,14 +82,14 @@
             PlaySound("gsLoginNewAccount");
             if ( BENILLA_REALMLIST_PINNED ) then
                 GlueDialog_Show("BENILLA_REALMLIST_PINNED", format(
-                    "$WOW_HOST is set for this session, so the realmlist is fixed at %s.",
+                    "本次会话已设置 $WOW_HOST，服务器列表固定为 %s。",
                     BENILLA_REALMLIST or ""));
             else
                 GlueDialog_Show("BENILLA_REALMLIST", nil, BENILLA_REALMLIST);
             end
         end
     </Script>
-    <Button name="BenillaRealmlistButton" inherits="GlueButtonSmallTemplate" parent="AccountLoginUI" text="Realmlist">
+    <Button name="BenillaRealmlistButton" inherits="GlueButtonSmallTemplate" parent="AccountLoginUI" text="服务器列表">
         <Anchors>
             <Anchor point="BOTTOM" relativeTo="AccountLoginCinematicsButton" relativePoint="TOP">
                 <Offset>

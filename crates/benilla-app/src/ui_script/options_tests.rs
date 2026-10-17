@@ -103,7 +103,7 @@ fn controls_is_the_default_category_and_the_title_reads_it() {
     assert_eq!(
         s.eval::<String>("return BenillaOptionsFrameContainerTitle:GetText()")
             .unwrap(),
-        "Controls"
+        "控制"
     );
     // The row labels are the era category tree's.
     assert_eq!(
@@ -171,7 +171,7 @@ fn clicking_a_row_moves_the_selection_and_the_page_title() {
     assert_eq!(
         s.eval::<String>("return BenillaOptionsFrameContainerTitle:GetText()")
             .unwrap(),
-        "Graphics"
+        "图形"
     );
 
     s.run("HideUIPanel(BenillaOptionsFrame)").unwrap();
@@ -179,7 +179,7 @@ fn clicking_a_row_moves_the_selection_and_the_page_title() {
     assert_eq!(
         s.eval::<String>("return BenillaOptionsFrameContainerTitle:GetText()")
             .unwrap(),
-        "Graphics"
+        "图形"
     );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
@@ -388,14 +388,14 @@ fn search_reflows_live_rows_and_restores_the_page() {
         .eval("return BenillaOptionsFrameContainerBodyAudioRowMaster:GetTop()")
         .unwrap();
 
-    s.run("BenillaOptionsFrameSearchBox:SetText(\"music\")")
+    s.run("BenillaOptionsFrameSearchBox:SetText(\"音乐\")")
         .unwrap();
     // The reflow runs from the box's `OnTextChanged`, which the engine defers to the drain.
     s.tick(0.0);
     assert_eq!(
         s.eval::<String>("return BenillaOptionsFrameContainerTitle:GetText()")
             .unwrap(),
-        "Search Results"
+        "搜索结果"
     );
     assert!(
         !s.eval::<bool>("return BenillaOptionsFrameContainerDefaults:IsVisible()")
@@ -449,7 +449,7 @@ fn search_reflows_live_rows_and_restores_the_page() {
     assert_eq!(
         s.eval::<String>("return BenillaOptionsFrameContainerTitle:GetText()")
             .unwrap(),
-        "Audio"
+        "音频"
     );
     assert!(s
         .eval::<bool>("return BenillaOptionsFrameContainerDefaults:IsVisible()")
@@ -466,18 +466,39 @@ fn search_reflows_live_rows_and_restores_the_page() {
 }
 
 /// The era scoring (`MatchesSearchTags`, Blizzard_Settings.lua): the whole query is the first
-/// word tried, so a phrase hit outscores its own words and leads its group.
+/// word tried, and a match scores its own length, so a longer match leads its group.
+///
+/// The labels are Chinese and Chinese puts no space between words, so the phrase-versus-word
+/// split the English labels used to exercise cannot arise from a typed query any more. The law
+/// is pinned on the scorer, and the ordering it produces on the live rows.
 #[test]
-fn the_phrase_match_outranks_its_words() {
+fn the_scorer_tries_the_whole_query_first_and_scores_by_length() {
     benilla_formats::wow_data_or_skip!();
     let mut s = harness_on(audio_harness());
     s.run("ShowUIPanel(BenillaOptionsFrame)").unwrap();
-    s.run("BenillaOptionsFrameSearchBox:SetText(\"master volume\")")
+
+    // The whole query is word one, ahead of the words it splits into.
+    assert_eq!(
+        s.eval::<String>(r#"return BenillaOptionsSearch_Words("音量 主")[1]"#)
+            .unwrap(),
+        "音量 主"
+    );
+    // A longer match scores higher: 音量 (six bytes) over 量 (three).
+    let (long, short): (f32, f32) = s
+        .eval(
+            r#"return BenillaOptionsSearch_Score("主音量", BenillaOptionsSearch_Words("音量")),
+                      BenillaOptionsSearch_Score("主音量", {"量"})"#,
+        )
+        .unwrap();
+    assert!(long > short, "音量 ({long}) outranks 量 ({short})");
+
+    // Every audio row carries 音量 at the same offset, so the scores tie and page order decides.
+    s.run("BenillaOptionsFrameSearchBox:SetText(\"音量\")")
         .unwrap();
     s.resolve();
     let tops: Vec<f32> = [
-        "BenillaOptionsFrameContainerBodyAudioRowMaster", // phrase hit, score 12
-        "BenillaOptionsFrameContainerBodyAudioRowSound",  // "VOLUME" hits, score 5, page order
+        "BenillaOptionsFrameContainerBodyAudioRowMaster",
+        "BenillaOptionsFrameContainerBodyAudioRowSound",
         "BenillaOptionsFrameContainerBodyAudioRowMusic",
         "BenillaOptionsFrameContainerBodyAudioRowAmbience",
     ]
@@ -486,7 +507,7 @@ fn the_phrase_match_outranks_its_words() {
     .collect();
     assert!(
         tops[0] > tops[1] && tops[1] > tops[2] && tops[2] > tops[3],
-        "phrase first, then the word matches in page order: {tops:?}"
+        "equal scores fall back to page order: {tops:?}"
     );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
@@ -498,7 +519,7 @@ fn a_head_click_ends_the_search_and_a_miss_shows_no_results() {
     let mut s = harness();
     s.run("ShowUIPanel(BenillaOptionsFrame)").unwrap();
 
-    s.run("BenillaOptionsFrameSearchBox:SetText(\"volume\")")
+    s.run("BenillaOptionsFrameSearchBox:SetText(\"音量\")")
         .unwrap();
     s.tick(0.0); // the reflow builds the head clicked below
     s.run("BenillaOptionsFrameContainerBodySearchHeadAudio:Click()")
@@ -519,7 +540,7 @@ fn a_head_click_ends_the_search_and_a_miss_shows_no_results() {
     assert_eq!(
         s.eval::<String>("return BenillaOptionsFrameContainerTitle:GetText()")
             .unwrap(),
-        "Audio"
+        "音频"
     );
     assert!(s
         .eval::<bool>("return BenillaOptionsFrameContainerBodyAudio:IsVisible()")
@@ -1057,14 +1078,14 @@ fn the_graphics_page_reads_the_cvar_table_on_select() {
             "return BenillaOptionsFrameContainerBodyGraphicsRowUiScaleLabel:GetText()"
         )
         .unwrap(),
-        "UI Scale"
+        "界面缩放"
     );
     assert_eq!(
         s.eval::<String>(
             "return BenillaOptionsFrameContainerBodyGraphicsRowFarclipLabel:GetText()"
         )
         .unwrap(),
-        "Terrain Distance"
+        "地形距离"
     );
 
     s.run("BenillaOptionsFrameCategoryListRowAudio:Click()")
@@ -1093,7 +1114,7 @@ fn the_display_mode_dropdown_maps_its_entries_to_the_gx_window_polarity() {
     assert_eq!(
         s.eval::<String>(&format!("return {ROW}Label:GetText()"))
             .unwrap(),
-        "Display Mode"
+        "显示模式"
     );
     assert_eq!(
         s.eval::<String>(&format!("return {ROW}DropdownText:GetText()"))
@@ -1152,7 +1173,7 @@ fn the_vertical_sync_row_reads_and_writes_the_present_mode_cvar() {
             "return BenillaOptionsFrameContainerBodyGraphicsRowVerticalSyncLabel:GetText()"
         )
         .unwrap(),
-        "Vertical Sync"
+        "垂直同步"
     );
     let _ = s.take_cvar_changes();
 
@@ -1257,7 +1278,7 @@ fn the_world_detail_slider_writes_the_cvar_and_the_readout_names_its_stop() {
     assert_eq!(
         s.eval::<String>(&format!("return {ROW}Label:GetText()"))
             .unwrap(),
-        "Environment Detail"
+        "环境细节"
     );
     assert_eq!(
         s.eval::<String>(&format!("return {ROW}ControlValue:GetText()"))
@@ -1560,7 +1581,7 @@ fn the_render_scale_row_shows_a_percentage_and_defers_to_apply() {
             "return BenillaOptionsFrameContainerBodyGraphicsRowRenderScaleLabel:GetText()"
         )
         .unwrap(),
-        "Render Scale"
+        "渲染比例"
     );
     assert_eq!(
         s.eval::<String>(
@@ -1792,7 +1813,7 @@ fn the_controls_page_reads_flags_with_the_sticky_inversion() {
             "return BenillaOptionsFrameContainerBodyControlsRowStickyTargetLabel:GetText()"
         )
         .unwrap(),
-        "Sticky Targeting"
+        "粘性目标选择"
     );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
@@ -1851,7 +1872,7 @@ fn the_controls_page_offers_click_to_move_on_autointeract() {
     assert_eq!(
         s.eval::<String>(&format!("return {row}Label:GetText()"))
             .unwrap(),
-        "Click-to-Move"
+        "点击移动"
     );
     assert!(
         !s.eval::<bool>(&format!("return {row}Check:GetChecked()"))
@@ -1921,6 +1942,10 @@ fn settle(s: &mut UiScript) {
 
 /// Results taller than the page grow the scroll body: the bar and its trough appear, and
 /// everything past the fold is clipped to the page rect.
+///
+/// The query is one letter. The options rows are Chinese now, so the breadth comes from the
+/// binding names, which the search also matches (`BenillaKeyBindings_SearchMatches`) and which
+/// stay in the install's language.
 #[test]
 fn a_broad_search_scrolls_the_page_instead_of_overflowing_it() {
     benilla_formats::wow_data_or_skip!();
@@ -1966,7 +1991,7 @@ fn a_broad_search_scrolls_the_page_instead_of_overflowing_it() {
         "the body is the page rect when nothing overflows: {body_w}x{body_h} vs {page_w}x{page_h}"
     );
 
-    s.run("BenillaOptionsFrameSearchBox:SetText(\"e\")")
+    s.run("BenillaOptionsFrameSearchBox:SetText(\"显示\")")
         .unwrap();
     settle(&mut s);
     let range: f32 = s
@@ -2070,7 +2095,7 @@ fn the_page_scroll_bar_wears_the_trough_with_its_arrows_in_the_sockets() {
     benilla_formats::wow_data_or_skip!();
     let mut s = harness_on(audio_harness());
     s.run("ShowUIPanel(BenillaOptionsFrame)").unwrap();
-    s.run("BenillaOptionsFrameSearchBox:SetText(\"e\")")
+    s.run("BenillaOptionsFrameSearchBox:SetText(\"显示\")")
         .unwrap();
     settle(&mut s);
 
@@ -2504,7 +2529,7 @@ fn the_combat_page_writes_saved_variable_globals_and_applies_them() {
             "return BenillaOptionsFrameContainerBodyCombatRowFloatModeDropdownText:GetText()"
         )
         .unwrap(),
-        "Scroll Up"
+        "向上滚动"
     );
 
     // The master first: it ships "0", which greys the other rows, and a greyed box eats its click.
@@ -2661,7 +2686,7 @@ fn defaults_resets_the_combat_page_to_the_shipped_assignments() {
             "return BenillaOptionsFrameContainerBodyCombatRowFloatModeDropdownText:GetText()"
         )
         .unwrap(),
-        "Scroll Up",
+        "向上滚动",
         "the capsule follows the reset"
     );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
@@ -3770,14 +3795,14 @@ fn the_camera_following_style_dropdown_carries_the_engine_enum_and_plate() {
             "return BenillaOptionsFrameContainerBodyControlsRowCameraFollowStyleDropdownText:GetText()"
         )
         .unwrap(),
-        "Smart"
+        "智能"
     );
     assert_eq!(
         s.eval::<String>(
             "return BenillaOptionsFrameContainerBodyControlsRowCameraFollowStyleLabel:GetText()"
         )
         .unwrap(),
-        "Camera Following Style"
+        "镜头跟随方式"
     );
     assert_eq!(
         s.eval::<String>("return BenillaOptionsFrameContainerBodyControlsRowCameraFollowStyle.tip")
@@ -3801,7 +3826,7 @@ fn the_camera_following_style_dropdown_carries_the_engine_enum_and_plate() {
              .. \",\" .. DropDownList1Button3:GetText()"
         )
         .unwrap(),
-        "Smart,Always,Never"
+        "智能,始终,从不"
     );
     assert!(s
         .eval::<bool>("return DropDownList1Button1Check:IsVisible()")
@@ -3863,7 +3888,7 @@ fn the_camera_following_style_dropdown_carries_the_engine_enum_and_plate() {
             "return BenillaOptionsFrameContainerBodyControlsRowCameraFollowStyleDropdownText:GetText()"
         )
         .unwrap(),
-        "Smart"
+        "智能"
     );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }
@@ -4059,16 +4084,17 @@ fn the_two_option_tabs_fit_their_labels_at_the_drawn_scale() {
             "{tab} is {w} wide; the era's law is its label ({l}) + 40"
         );
     }
-    // At 0.78 a 6-unit glyph rasters at 5 px and reads back 5/0.78 units: "Game" is 25.64 and
-    // "AddOns" 38.46, where a fit at scale 1 would give tabs of 64 and 76.
+    // At 0.78 a 6-unit glyph rasters at 5 px and reads back 5/0.78 units, so each tab's
+    // two-character label measures 12.82 and its width 52.82; a fit at scale 1 would give 52.
     let close = |a: f32, b: f32| (a - b).abs() < 0.01;
+    let tab = 2.0 * 5.0 / 0.78 + 40.0;
     assert!(close(
         num(&mut s, "BenillaOptionsFrameGameTab:GetWidth()"),
-        65.641_03
+        tab
     ));
     assert!(close(
         num(&mut s, "BenillaOptionsFrameAddOnsTab:GetWidth()"),
-        78.461_54
+        tab
     ));
 
     // Frames run afterwards change nothing.
@@ -4078,11 +4104,11 @@ fn the_two_option_tabs_fit_their_labels_at_the_drawn_scale() {
     }
     assert!(close(
         num(&mut s, "BenillaOptionsFrameGameTab:GetWidth()"),
-        65.641_03
+        tab
     ));
     assert!(close(
         num(&mut s, "BenillaOptionsFrameAddOnsTab:GetWidth()"),
-        78.461_54
+        tab
     ));
 
     // A re-show re-fits, as the stock template does.
@@ -4091,7 +4117,7 @@ fn the_two_option_tabs_fit_their_labels_at_the_drawn_scale() {
     s.resolve();
     assert!(close(
         num(&mut s, "BenillaOptionsFrameGameTab:GetWidth()"),
-        65.641_03
+        tab
     ));
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }

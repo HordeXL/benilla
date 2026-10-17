@@ -133,7 +133,7 @@ fn the_unbacked_entries_are_disabled_and_the_rest_are_live() {
     assert_eq!(
         s.eval::<String>("return BenillaGameMenuButtonEditMode:GetText()")
             .unwrap(),
-        "Edit Mode"
+        "编辑模式"
     );
     assert_eq!(
         s.eval::<String>("return GameMenuButtonContinue:GetText()")
@@ -143,7 +143,7 @@ fn the_unbacked_entries_are_disabled_and_the_rest_are_live() {
     assert_eq!(
         s.eval::<String>("return GameMenuButtonOptions:GetText()")
             .unwrap(),
-        "Options"
+        "选项"
     );
     assert!(s.errors().is_empty(), "script errors: {:?}", s.errors());
 }

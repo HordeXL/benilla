@@ -30,10 +30,10 @@ impl NoInstall {
     /// as no folder, the case the reference's `0x403b6f` covers for a base archive.
     pub(crate) fn unreadable(data_dir: &std::path::Path, err: &anyhow::Error) -> Self {
         Self {
-            title: "benilla: the WoW install cannot be read",
+            title: "benilla：无法读取 WoW 安装",
             message: format!(
-                "benilla found a World of Warcraft install at\n  {}\nbut cannot read its archives:\n  \
-                 {err:#}\n\nCheck that this is an unmodified 1.12.1 Data folder.",
+                "benilla 在以下位置找到了 World of Warcraft 安装：\n  {}\n但无法读取其档案：\n  \
+                 {err:#}\n\n请确认这是一个未经修改的 1.12.1 Data 文件夹。",
                 data_dir.display()
             ),
         }
@@ -44,27 +44,26 @@ impl NoInstall {
 /// and `looked_in` its [`benilla_formats::candidates`], named in order in the message.
 pub(crate) fn require(found: Option<PathBuf>, looked_in: &[PathBuf]) -> Result<PathBuf, NoInstall> {
     found.ok_or_else(|| NoInstall {
-        title: "benilla: no WoW install found",
+        title: "benilla：未找到 WoW 安装",
         message: message(looked_in),
     })
 }
 
 /// What to tell the player: the folders searched and the two ways to supply an install.
 fn message(looked_in: &[PathBuf]) -> String {
-    let mut out =
-        String::from("benilla needs a World of Warcraft 1.12.1 install and found none.\n");
+    let mut out = String::from("benilla 需要 World of Warcraft 1.12.1 的安装，但没有找到。\n");
     if looked_in.is_empty() {
         // `$WOW_DATA` set and empty ends the search with nothing in it.
-        out.push_str("\nWOW_DATA is set and empty, which means no install.\n");
+        out.push_str("\nWOW_DATA 已设置但为空，这表示没有安装。\n");
     } else {
-        out.push_str("\nIt looked in:\n");
+        out.push_str("\n已查找以下位置：\n");
         for dir in looked_in {
             out.push_str(&format!("  {}\n", dir.display()));
         }
     }
     out.push_str(
-        "\nPut the install's Data folder at Data/ or WoW/Data/ beside the benilla binary, \
-         or point WOW_DATA at it.",
+        "\n把安装的 Data 文件夹放到 benilla 程序旁的 Data/ 或 WoW/Data/ 目录，或者把 WOW_DATA \
+         指向它。",
     );
     out
 }
@@ -119,10 +118,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{dir:?} not named in order in:\n{msg}"));
             from += at;
         }
-        assert!(
-            msg.contains("Data/ or WoW/Data/ beside the benilla binary"),
-            "{msg}"
-        );
+        assert!(msg.contains("Data/ 或 WoW/Data/"), "{msg}");
         assert!(msg.contains("WOW_DATA"), "{msg}");
     }
 
@@ -131,11 +127,11 @@ mod tests {
     fn an_empty_wow_data_is_named_as_the_reason() {
         let err = require(None, &[]).expect_err("no install must be fatal");
         assert!(
-            err.message().contains("WOW_DATA is set and empty"),
+            err.message().contains("WOW_DATA 已设置但为空"),
             "{}",
             err.message()
         );
-        assert!(!err.message().contains("looked in"));
+        assert!(!err.message().contains("已查找以下位置"));
     }
 
     /// An install found goes on, whatever else was searched.
@@ -162,8 +158,8 @@ mod tests {
         );
         assert!(err
             .message()
-            .contains("/games/benilla/Data\nbut cannot read"));
+            .contains("/games/benilla/Data\n但无法读取其档案"));
         assert!(err.message().contains("no known vanilla MPQs"));
-        assert_ne!(err.title, "benilla: no WoW install found");
+        assert_ne!(err.title, "benilla：未找到 WoW 安装");
     }
 }
