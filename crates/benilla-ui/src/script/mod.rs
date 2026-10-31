@@ -36,7 +36,7 @@ mod worldmap_arrow;
 mod button;
 mod calls;
 mod camera_view;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(debug_assertions)]
 pub mod census;
 mod channel;
 mod char_stats;
@@ -349,7 +349,7 @@ pub use guild::{
 };
 pub use guild_read::{GuildAnswer, GuildRead, OwnGuild, UnitGuildRead};
 pub use held::{BagGuidQuery, BagHead, BagItemsQuery, BagQuery, BagSlotQuery, HasKeyQuery};
-pub use host::{CallHost, CallTail, Deferring, LiveReader};
+pub use host::{CallHost, CallTail, LiveReader};
 pub use input_verbs::{
     BindingInput, ClickCall, ClickMode, ClickPress, FiredInput, HeldInput, LookCall,
     MouselookingQuery, PostureCall, ViewAxis,
@@ -861,7 +861,7 @@ impl UiScript {
         let lua = install_framescript(VmKind::InGame)?;
         install_in_game(&lua)?;
         object::guard_receivers(&lua)?;
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(debug_assertions)]
         census::survey_listener(&lua);
         Ok(Self::host(lua))
     }
