@@ -30,8 +30,9 @@ pub(crate) struct RemoteMotion {
     pub(crate) vertical_velocity: f32,
     /// The launch's `(cos, sin) * xyspeed`, frozen for the arc; `[0; 2]` on the ground.
     pub(crate) jump_xy_vel: [f32; 2],
-    /// This arc's takeoff height, `None` if the mover entered view airborne; on landing, its
-    /// drop to the landing is the fall height that gates the grunt and dust puff.
+    /// This arc's start height (`+0x7c`), which every airborne apply re-derives from the packet
+    /// ([`FallHeight::airborne`]); `None` on the ground. On landing, its drop to the landing is
+    /// the fall height that gates the grunt and dust puff.
     pub(crate) fall_start: Option<FallHeight>,
     /// Not-yet-due relayed moves by fire-time, the reference's `CMovement+0x150` queue.
     pub(crate) pending: std::collections::VecDeque<PendingMove>,
@@ -40,16 +41,10 @@ pub(crate) struct RemoteMotion {
     /// since is our extrapolation.
     pub(crate) last_apply_ms: f64,
     pub(crate) last_apply_pos: [f32; 3],
-}
-
-/// What a unit's create leaves on its mover for the relays to come, until its first relay builds
-/// its [`RemoteMotion`]: the replay chain the create's forced apply seeded
-/// ([`RelayChain::seed_at_create`]) and the flags word it wrote (`new & 0x75a07dff` over a cleared
-/// word, `0x61936e`, `0x618de7`), which the first relay's schedule reads as the mover's.
-#[derive(Component, Clone)]
-pub(crate) struct RelaySeed {
-    pub(crate) chain: RelayChain,
-    pub(crate) flags: u32,
+    /// The fire-time of the move this frame's tick fired, where its pose stands: the frame's step
+    /// runs on from it, not from the frame's start ([`drain_pending_moves`]). `None`, the
+    /// whole frame.
+    pub(crate) fired_at_ms: Option<f64>,
 }
 
 /// A relayed pose's height in both frames its packet carries: the world's, and the deck's while
@@ -66,6 +61,24 @@ impl FallHeight {
         Self {
             world_z: ev.position[2],
             aboard: ev.transport.as_ref().map(|t| (t.guid, t.pos.z)),
+        }
+    }
+
+    /// The start height an airborne status puts on its mover: the pose's height raised by the
+    /// arc's drop over the status's fall time, `z + D(ms)` (`0x7c6490` → `0x7c5f30`, stored at
+    /// `0x7c64b2`; the same at `0x61a7dc`), the launch speed and the cap the status's own. Aboard,
+    /// the deck-local height rises by the same drop (`0x7c6900`).
+    pub(crate) fn airborne(
+        position: [f32; 3],
+        transport: Option<&benilla_protocol::TransportPose>,
+        jump: Option<JumpInfo>,
+        fall_time: u32,
+        feather: bool,
+    ) -> Self {
+        let drop = fall_drop(jump.map_or(0.0, |j| j.zspeed), fall_time, feather);
+        Self {
+            world_z: position[2] + drop,
+            aboard: transport.map(|t| (t.guid, t.pos.z + drop)),
         }
     }
 
@@ -87,6 +100,8 @@ impl FallHeight {
 pub(in crate::net) enum RelayOutcome {
     /// Due, with an empty queue.
     Now,
+    /// A path is live: applied at once (`0x618c43`).
+    Forced,
     Queued,
     /// The first packet on a chain no create seeded, placed at once (only under
     /// `WOW_REMOTE_SNAP=1`: that packet's fire-time is its arrival, past the movement clock).
@@ -104,6 +119,7 @@ impl RelayOutcome {
     fn tag(self) -> &'static str {
         match self {
             Self::Now => "now",
+            Self::Forced => "forced",
             Self::Queued => "queued",
             Self::Seed => "seed",
             Self::SelfMover => "self",
@@ -312,8 +328,18 @@ pub(in crate::net) fn apply_move(
     let now_falling = ev.flags & FALLING != 0;
     // The `FALLING` to grounded edge is a landing; its fall height gates the grunt and dust puff.
     let was_falling = rm.flags & FALLING != 0;
-    let (new_start, descent) =
-        fall_arc_step(was_falling, now_falling, rm.fall_start, FallHeight::of(ev));
+    let packet = if now_falling {
+        FallHeight::airborne(
+            ev.position,
+            ev.transport.as_ref(),
+            ev.jump,
+            ev.fall_time,
+            ev.flags & move_flags::SAFE_FALL != 0,
+        )
+    } else {
+        FallHeight::of(ev)
+    };
+    let (new_start, descent) = fall_arc_step(was_falling, now_falling, rm.fall_start, packet);
     rm.fall_start = new_start;
     if let Some(descent) = descent {
         landings.write(crate::creature_anim::HardLanding { entity: e, descent });
@@ -347,9 +373,12 @@ pub(in crate::net) fn apply_move(
 pub(crate) struct MoveTick(pub(crate) Option<f64>);
 
 /// Fires every due queued move (the drain `0x615c30`), then stamps the movement clock
-/// ([`MoveTick`]); runs before [`extrapolate_remote_units`]. Real time: the reference's clock is
-/// the OS wall clock (`0x42c010`), and Bevy's virtual clock clamps each delta to 250 ms, so a
-/// throttled window would fall behind the schedule.
+/// ([`MoveTick`]); runs before [`extrapolate_remote_units`]. A fired move stands its mover at its
+/// fire-time, which the frame's step then runs on from: `CMovement::AdvanceTo` (`0x616620`) cuts
+/// each step at the queued head's time (`0x61668f`-`0x61669c`) and applies the move there
+/// (`0x615c30`), so only the window's rest moves the mover under the new flags. Real time: the
+/// reference's clock is the OS wall clock (`0x42c010`), and Bevy's virtual clock clamps each
+/// delta to 250 ms, so a throttled window would fall behind the schedule.
 #[allow(clippy::type_complexity)]
 pub(in crate::net) fn drain_pending_moves(
     time: Res<Time<Real>>,
@@ -363,6 +392,7 @@ pub(in crate::net) fn drain_pending_moves(
         while rm.pending.front().is_some_and(|ev| ev.fire_ms <= now_ms) {
             let ev = rm.pending.pop_front().expect("front checked");
             apply_move(e, &ev.mv, &mut rm, now_ms, &mut commands, &mut landings);
+            rm.fired_at_ms = Some(ev.fire_ms);
         }
     }
     tick.0 = Some(now_ms);
@@ -535,14 +565,26 @@ pub(in crate::net) fn extrapolate_remote_units(
             // Modes from `SMSG_SPLINE_MOVE_*`, which vmangos sends only for a unit it drives; a
             // player's ride the pose, so the union is the reference's one `CMovement+0x40` word.
             Option<&crate::net::UnitMoveModes>,
+            // Whose standing facing the display smoother turns ([`super::facing::smoothed`]).
+            Option<&crate::net::NetEntity>,
+            Option<&crate::net::ObjectStore>,
         ),
         (Without<Spline>, Without<ActiveMover>),
     >,
 ) {
     use crate::creature_anim::{ease_strafe_yaw, strafe_body_offset, wrap_pi};
-    let dt = time.delta_secs();
+    let frame_dt = time.delta_secs();
     let now_ms = time.elapsed_secs_f64() * 1000.0;
-    for (e, mut t, mut rm, speeds, twist, latched, riding, guid, granted) in &mut q {
+    for (e, mut t, mut rm, speeds, twist, latched, riding, guid, granted, net, store) in &mut q {
+        // The window this mover steps: the frame's, or its rest past a move the tick fired in it.
+        let step = match rm.fired_at_ms.take() {
+            Some(fired) => {
+                let rest = ((now_ms - fired) / 1000.0).clamp(0.0, time.delta().as_secs_f64());
+                std::time::Duration::from_secs_f64(rest)
+            }
+            None => time.delta(),
+        };
+        let dt = step.as_secs_f32();
         if benilla_assets::trace::enabled() {
             let silent = now_ms - rm.last_apply_ms;
             let moving = rm.flags & move_flags::ANY_MOVE != 0;
@@ -566,7 +608,7 @@ pub(in crate::net) fn extrapolate_remote_units(
             vertical_velocity,
             speed,
             held,
-        } = reckon(e, &rm, s, modes, riding, time.delta(), Some(&world));
+        } = reckon(e, &rm, s, modes, riding, step, Some(&world));
         // The pre-fire reconcile toward the queued head, facing (armed by `0x619030`) and position
         // (`0x619090`); a teleport arms neither (`@0x61904b`, `@0x6190bb`).
         if let Some(ev) = rm.pending.front() {
@@ -579,6 +621,11 @@ pub(in crate::net) fn extrapolate_remote_units(
                 pos = reconcile_lerp(pos, predicted, ev.mv.position, swimming, dt, remaining_s);
             }
         }
+        // A standing creature's facing is the display smoother's, its rows 2 to 9
+        // ([`super::facing::drive_display_facing`]); only a moving one's is its mover's (row 1).
+        let unit_flags = store.map_or(0, |s| s.0.unit_flags());
+        let smoother_faces = super::facing::smoothed(net.map(|n| n.kind), unit_flags, false)
+            && !super::facing::moving(false, Some(&rm));
         // A mouse-turning mover sends no turn flag, only facing packets, so a standing, grounded
         // mover's applied yaw latches the shuffle (the reference's display-facing latch,
         // `0x607ed0` to `+0xd58` `0x800`/`0x1000` to `0x712090`, anims 11 and 12).
@@ -594,7 +641,9 @@ pub(in crate::net) fn extrapolate_remote_units(
         } else {
             0.0
         };
-        if step.abs() > super::facing::TURN_LATCH_BAND {
+        if smoother_faces {
+            // The smoother's pump owns the latch.
+        } else if step.abs() > super::facing::TURN_LATCH_BAND {
             commands.entity(e).insert(super::FacingStep(step));
         } else if latched {
             commands.entity(e).remove::<super::FacingStep>();
@@ -623,6 +672,9 @@ pub(in crate::net) fn extrapolate_remote_units(
         if t.translation != translation {
             t.translation = translation;
         }
+        if smoother_faces {
+            continue;
+        }
         // The strafe body pose, as our own avatar's; swimming snaps the display facing to the aim
         // (`0x607ed0`'s `mov [esi+0xc94],[esi+0xc98]`).
         let swimming = rm.flags & move_flags::SWIMMING != 0;
@@ -632,7 +684,7 @@ pub(in crate::net) fn extrapolate_remote_units(
             strafe_body_offset(rm.flags)
         };
         let yaw = if offset != 0.0 {
-            ease_strafe_yaw(yaw_of(t.rotation), orientation, offset, dt)
+            ease_strafe_yaw(yaw_of(t.rotation), orientation, offset, frame_dt)
         } else {
             orientation
         };
@@ -673,8 +725,24 @@ pub(crate) fn jump_seed(jump: Option<JumpInfo>, fall_time: u32, feather: bool) -
     }
 }
 
+/// The drop `D(t)` `fall_time` ms into an arc launched at `zspeed` (down-positive), `0x7c5e70`:
+/// the parabola to the cap, then straight at it, the cap 7.0 under feather fall.
+pub(in crate::net) fn fall_drop(zspeed: f32, fall_time: u32, feather: bool) -> f32 {
+    let terminal = if feather {
+        crate::player::FEATHER_TERMINAL_VELOCITY
+    } else {
+        TERMINAL_VELOCITY
+    };
+    let t = fall_time as f32 * 0.001;
+    // `fall_step` is up-positive: its mean times `t` is the rise, the drop's negative.
+    let (_, mean) = crate::player::mover::fall_step(-zspeed, t, terminal);
+    -mean * t
+}
+
 /// One packet's step of the landing predictor: `(fall_start, descent)`, the descent
-/// `takeoff - landing` only on the `FALLING` to grounded edge with a known takeoff.
+/// `start - landing` only on the `FALLING` to grounded edge with a known start. `packet` is an
+/// airborne packet's start height ([`FallHeight::airborne`]), which each one re-derives, or a
+/// grounded one's height.
 pub(in crate::net) fn fall_arc_step(
     was_falling: bool,
     now_falling: bool,
@@ -683,7 +751,7 @@ pub(in crate::net) fn fall_arc_step(
 ) -> (Option<FallHeight>, Option<f32>) {
     match (was_falling, now_falling) {
         (false, true) => (Some(packet), None), // takeoff
-        (true, true) => (fall_start, None),    // still airborne
+        (true, true) => (Some(packet), None),  // still airborne: re-derived
         (true, false) => (None, fall_start.map(|start| start.drop_to(packet))), // landing edge
         (false, false) => (None, None),        // grounded
     }
@@ -834,6 +902,7 @@ mod under_floor {
             relay: RelayChain::default(),
             last_apply_ms: 0.0,
             last_apply_pos: [0.0, 0.0, wow_z],
+            fired_at_ms: None,
         }
     }
 
@@ -866,6 +935,26 @@ mod under_floor {
             .id();
         app.update(); // seats Position/Rotation and the collider trees
         (app, e)
+    }
+
+    /// A standing creature's dead-reckoning leaves its facing to the display smoother
+    /// ([`super::super::facing::drive_display_facing`]), which turns it from where it shows.
+    #[test]
+    fn a_standing_creatures_facing_is_left_to_the_smoother() {
+        let (mut app, e) = half_arrived_world(0);
+        let shown = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        app.world_mut().entity_mut(e).insert(crate::net::NetEntity {
+            kind: benilla_protocol::EntityKind::Unit,
+            display_id: None,
+            scale: 1.0,
+        });
+        app.world_mut().get_mut::<Transform>(e).unwrap().rotation = shown;
+        frames(&mut app, 3);
+        assert_eq!(
+            app.world().get::<Transform>(e).unwrap().rotation,
+            shown,
+            "the mover's own facing, 0, does not snap it"
+        );
     }
 
     fn frames(app: &mut App, n: usize) {
