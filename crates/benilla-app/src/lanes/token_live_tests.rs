@@ -942,6 +942,42 @@ fn a_listener_reads_a_rooted_members_move_after_a_refused_path_where_it_put_it()
     assert_eq!(seen, ["0.7,0.8"]);
 }
 
+/// A stop 10 yd from its member runs it there: the stop form is a path when its point is 3 yd
+/// or more off (`0x6019be`), one leg at 4× the run speed (`0x601f49`), 28 yd/s here, over
+/// `len / speed · 1000` = 357 ms (`0x601f9d`-`0x601fcc`); at its end a later packet's listener
+/// reads the member at the stop point.
+#[test]
+fn a_listener_reads_a_member_a_far_stop_ran_to_at_the_stop_point() {
+    let mut c = seated(0);
+    fine_map_spy(&mut c, "party1");
+    let mate = c.app.world().resource::<crate::net::GuidIndex>().0[&MATE];
+    c.app
+        .world_mut()
+        .entity_mut(mate)
+        .insert(crate::net::UnitSpeeds(benilla_protocol::MoveSpeeds {
+            run: 7.0,
+            ..Default::default()
+        }));
+    c.frame(vec![vec![halt(MATE, [510.0, 600.0, 0.0])]]);
+    let spline = c
+        .app
+        .world()
+        .get::<crate::net::Spline>(mate)
+        .expect("the far stop runs a path");
+    assert_eq!(spline.points, [[500.0, 600.0, 0.0], [510.0, 600.0, 0.0]]);
+    assert_eq!(spline.duration, std::time::Duration::from_millis(357));
+    // The path's clock is real time: run it to its end.
+    c.app
+        .world_mut()
+        .get_mut::<crate::net::Spline>(mate)
+        .expect("still riding")
+        .start -= std::time::Duration::from_secs(1);
+    c.frame(vec![]);
+    c.frame(vec![vec![member_at(MATE, 20, ELWYNN, (100, 200))]]);
+    let seen: Vec<String> = c.eval(false, "return Fine");
+    assert_eq!(seen, ["0.5100,0.6000"]);
+}
+
 /// A monster move's stop holds its spline, so the next move applies at once, where a later
 /// packet's listener reads it: a stop within 3 yd allocates the mover's spline (`0x6019be` →
 /// `0x618750` → `0x619300`), whose end keeps it for a remote mover (`0x619de0`), and a held
@@ -1331,6 +1367,46 @@ fn a_listener_reads_a_member_created_at_its_paths_end_where_it_stood() {
     c.frame(vec![vec![member_at(MATE, 20, ELWYNN, (100, 200))]]);
     let seen: Vec<String> = c.eval(false, "return Fine");
     assert_eq!(seen, ["0.5000,0.6000"]);
+}
+
+/// A member created on a path already ridden stands at the path's end, facing down its last leg,
+/// where a later packet's listener reads it: the create installs the path (`0x619387`), whose
+/// end places the mover at the last point from 3 yd (`0x61a874` → `0x616d60`) and leaves the
+/// follower's heading (`0x7c5490`). Created at (500, 600), the path ends 14.1 yd off at
+/// (510, 610), heading +y.
+#[test]
+fn a_listener_reads_a_member_created_on_a_ridden_path_at_its_end() {
+    let mut c = client();
+    map_spy(&mut c, "party1");
+    fine_map_spy(&mut c, "party1");
+    let mut create = living(mate_created([500.0, 600.0, 0.0], None), FORWARD, 0);
+    if let SessionEvent::ObjectCreate { spline, .. } = &mut create {
+        *spline = Some(benilla_protocol::CreateSpline {
+            path: vec![[510.0, 590.0, 0.0], [510.0, 610.0, 0.0]],
+            id: 6,
+            time_passed_ms: 2000,
+            duration_ms: 2000,
+            flying: false,
+            cyclic: false,
+            run_mode: true,
+            facing: benilla_protocol::MonsterMoveFacing::None,
+        });
+    }
+    c.frame(vec![vec![create]]);
+    c.frame(vec![vec![member_at(MATE, 20, ELWYNN, (100, 200))]]);
+    let seen: Vec<String> = c.eval(false, "return Fine");
+    assert_eq!(seen, ["0.5100,0.6100"]);
+    let mate = c.app.world().resource::<crate::net::GuidIndex>().0[&MATE];
+    let facing = c
+        .app
+        .world()
+        .get::<crate::net::RemoteMotion>(mate)
+        .expect("mover state")
+        .orientation;
+    assert!(
+        (facing - std::f32::consts::FRAC_PI_2).abs() < 1e-5,
+        "down the last leg: {facing}"
+    );
 }
 
 /// A member created a second into a fall from rest starts its arc g/2, 9.6455 yd, above where it

@@ -18,9 +18,10 @@ use benilla_world::model_fade::DespawnFade;
 use benilla_world::vis_chain::VisChainOnly;
 
 use super::motion::{
-    catch_up, create_spline, gameobject_rotation, monster_move_spline, pose_transform,
-    resolve_facing, set_raw_facing, smoothed, trace_create_spline, trace_move_snap, wire_yaw,
-    write_pose, HeldSpline, MoverWorld, SplineStopped, ROOT_APPLY_WIPE,
+    catch_up, create_spline, far_stop, gameobject_rotation, monster_move_spline, pose_transform,
+    resolve_facing, ridden_create_path, set_raw_facing, smoothed, snap_from_three_yards,
+    trace_create_spline, trace_move_snap, wire_yaw, write_pose, HeldSpline, MoverWorld,
+    SplineStopped, ROOT_APPLY_WIPE,
 };
 use super::{
     ActiveMover, FieldChanged, Guid, GuidIndex, NetCommands, NetEntity, NetHandlerApp, ObjectStore,
@@ -710,6 +711,27 @@ fn on_monster_move(In(ev): In<SessionEvent>, mut sc: Scene) {
                 sc.commands.entity(e).insert(HeldSpline);
             }
         }
+        // A stop 3 yd or more from the unit runs as a path there, its form's run-mode flag `0x100`
+        // set (`0x601a28`) ([`far_stop`]).
+        let far = stop
+            .then(|| sc.index.0.get(&guid).copied())
+            .flatten()
+            .and_then(|e| {
+                let from = match transport {
+                    Some(_) => sc.riders.get(e).ok().map(|r| r.local_pos),
+                    None => sc
+                        .transforms
+                        .get(e)
+                        .ok()
+                        .map(|t| bevy_to_wow(t.translation)),
+                }?;
+                let run = sc.speeds.get(e).map_or(0.0, |u| u.0.run);
+                far_stop(from, start, run)
+            });
+        let (path, duration_ms, stop, run_mode) = match far {
+            Some((leg, ms)) => (leg, ms, false, true),
+            None => (path, duration_ms, stop, run_mode),
+        };
         let smooth = sc.index.0.get(&guid).is_some_and(|&e| {
             let flags = sc.stores.get(e).map_or(0, |s| s.0.unit_flags());
             smoothed(
@@ -739,8 +761,9 @@ fn on_monster_move(In(ev): In<SessionEvent>, mut sc: Scene) {
         );
         // A path started on the active mover runs its input tick (`0x6187a0` → `0x602053`), whose
         // precondition the server's spline fails (`0x5144e0`): the teardown leg stops the auto-move
-        // (`0x5146d6`). A stop starts no path, and nor does a rooted mover: the start returns 0 on
-        // the root bit `0x1000` (`0x6187c2`-`0x6187c7`), so `0x601fee` skips the tick.
+        // (`0x5146d6`). A near stop starts no path, and nor does a rooted mover: the start
+        // returns 0 on the root bit `0x1000` (`0x6187c2`-`0x6187c7`), so `0x601fee` skips the
+        // tick.
         let mover_rooted = sc
             .player
             .as_deref()
@@ -973,7 +996,27 @@ fn object_create(
     // `WOW_CREATE_SPLINE=off` run still records what the wire offered.
     trace_create_spline(guid, spline.as_ref());
     let carries_path = spline.is_some();
+    // A path already ridden ends on the unit off the deck: at its last point from 3 yd, facing
+    // its end ([`ridden_create_path`]); a target not found leaves the leg's heading (`0x61a8b7`).
+    let ridden = spline
+        .as_ref()
+        .filter(|_| rider.is_none())
+        .and_then(|s| ridden_create_path(s).map(|end| (end, s.facing)));
     let walk = spline.and_then(create_spline);
+    let (position, end_facing) = match ridden {
+        Some(((last, leg), facing)) => {
+            let at = snap_from_three_yards(position, last);
+            let target_pos = |g: u64| {
+                sc.index
+                    .0
+                    .get(&g)
+                    .and_then(|&te| sc.transforms.get(te).ok())
+                    .map(|t| bevy_to_wow(t.translation))
+            };
+            (at, resolve_facing(facing, at, target_pos).or(leg))
+        }
+        None => (position, None),
+    };
     // A unit's status applies forced (`0x619320` → `0x618c30`): the mover takes the block's pose
     // and its flags word (`new & 0x75a07dff` over the word `0x61936e` cleared), and its replay
     // chain re-seeds from the block's stamp and the clock, on its own ring, which a held unit
@@ -1028,7 +1071,7 @@ fn object_create(
                 relay.seed_at_create(m.time, now_ms);
                 RemoteMotion {
                     wow_pos: position,
-                    orientation: seat.map_or(orientation, |(_, yaw)| yaw),
+                    orientation: end_facing.unwrap_or(seat.map_or(orientation, |(_, yaw)| yaw)),
                     flags,
                     pitch: m.pitch,
                     speed: 0.0,
